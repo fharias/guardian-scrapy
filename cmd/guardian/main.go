@@ -63,6 +63,7 @@ func main() {
 		middleware.Init,
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(90),
+		middleware.Honeypot(50, cfg.HoneypotPaths...),
 		middleware.Enforce(85),
 	)
 	mux.Handle("/", handler)

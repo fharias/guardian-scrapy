@@ -21,8 +21,8 @@ type Config struct {
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
 	DrainDelay        time.Duration `yaml:"drain_delay"`
 	PreserveHost      bool          `yaml:"preserve_host"`
-
-	UpstreamURL *url.URL `yaml:"-"`
+	HoneypotPaths     []string      `yaml:"honeypot_paths"`
+	UpstreamURL       *url.URL      `yaml:"-"`
 }
 
 func Load(path string) (*Config, error) {

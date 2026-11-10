@@ -7,3 +7,7 @@ idle_timeout: 10s
 shutdown_timeout: 20s
 drain_delay: 5s
 preserve_host: true
+honeypot_paths:
+  - "/robots.txt"
+  - "/favicon.ico"
+  - "/admin-oculto"

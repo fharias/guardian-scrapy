@@ -12,7 +12,11 @@ import (
 // Inicializa el middleware de verificación de acceso
 func Init(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		v := &verdict.Verdict{}
+		v := &verdict.Verdict{
+			Score:    0,
+			Reasons:  []string{},
+			Decision: verdict.Allow,
+		}
 		ctx := verdict.WithVerdict(r.Context(), v)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -67,6 +71,23 @@ func Enforce(blockAt int) Middleware {
 				v.Decision = verdict.Block
 				http.Error(w, "acceso denegado", http.StatusForbidden)
 				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// Bloqua honeypots (rutas que no existen)
+func Honeypot(points int, paths ...string) Middleware {
+	trap := make(map[string]bool)
+	for _, path := range paths {
+		trap[path] = true
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil && trap[r.URL.Path] {
+				v.Add(points, "honeypot")
 			}
 			next.ServeHTTP(w, r)
 		})
