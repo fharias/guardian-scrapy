@@ -1,0 +1,4 @@
+listen: ":8080"
+upstream: "http://localhost:9001"
+read_header_timeout: 5s
+preserve_host: true

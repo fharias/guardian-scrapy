@@ -1,23 +1,29 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
-	"time"
+
+	"github.com/fharias/guardian-scrapy/internal/config"
 )
 
 func main() {
-	upstream, err := url.Parse("http://localhost:9000")
+	path := flag.String("config", "guardian-config.yml", "ruta del archivo de configuración")
+	flag.Parse()
+
+	cfg, err := config.Load(*path)
 	if err != nil {
-		log.Fatalf("URL de upstream inválida: %v", err)
+		log.Fatal(err)
 	}
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(upstream)
-			pr.Out.Host = pr.In.Host
+			pr.SetURL(cfg.UpstreamURL)
+			if cfg.PreserveHost {
+				pr.Out.Host = pr.In.Host
+			}
 			pr.SetXForwarded()
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -27,11 +33,11 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:              ":8080",
+		Addr:              cfg.Listen,
 		Handler:           proxy,
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 	}
 
-	log.Printf("guardian escuchando en %s -> %s", srv.Addr, upstream)
+	log.Printf("guardian escuchando en %s -> %s", srv.Addr, cfg.UpstreamURL)
 	log.Fatal(srv.ListenAndServe())
 }
