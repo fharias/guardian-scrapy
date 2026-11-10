@@ -1,12 +1,20 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/config"
+	"github.com/fharias/guardian-scrapy/internal/middleware"
 )
 
 func main() {
@@ -32,12 +40,62 @@ func main() {
 		},
 	}
 
+	var ready atomic.Bool
+	ready.Store(true)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if ready.Load() {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if ready.Load() {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	handler := middleware.Chain(proxy,
+		middleware.Init,
+		middleware.Logger(logger),
+		middleware.SuspiciousUA(90),
+		middleware.Enforce(85),
+	)
+	mux.Handle("/", handler)
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           proxy,
+		Handler:           mux,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 
-	log.Printf("guardian escuchando en %s -> %s", srv.Addr, cfg.UpstreamURL)
-	log.Fatal(srv.ListenAndServe())
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		log.Printf("guardian escuchando en %s -> %s", srv.Addr, cfg.UpstreamURL)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("error al escuchar: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("señal recibida: dejando de estar listo")
+	ready.Store(false)
+	time.Sleep(cfg.DrainDelay)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	log.Println("cerrando: esperando requests en curso")
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("apagado forzado: %v", err)
+		return
+	}
+	log.Println("apagado limpio")
+
 }

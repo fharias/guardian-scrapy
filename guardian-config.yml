@@ -1,4 +1,9 @@
 listen: ":8080"
-upstream: "http://localhost:9001"
+upstream: "http://localhost:9000"
 read_header_timeout: 5s
+read_timeout: 20s
+write_timeout: 20s
+idle_timeout: 10s
+shutdown_timeout: 20s
+drain_delay: 5s
 preserve_host: true

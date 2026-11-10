@@ -15,6 +15,11 @@ type Config struct {
 	Listen            string        `yaml:"listen"`
 	Upstream          string        `yaml:"upstream"`
 	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
+	ReadTimeout       time.Duration `yaml:"read_timeout"`
+	WriteTimeout      time.Duration `yaml:"write_timeout"`
+	IdleTimeout       time.Duration `yaml:"idle_timeout"`
+	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
+	DrainDelay        time.Duration `yaml:"drain_delay"`
 	PreserveHost      bool          `yaml:"preserve_host"`
 
 	UpstreamURL *url.URL `yaml:"-"`
@@ -29,7 +34,11 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		Listen:            ":8080",
 		ReadHeaderTimeout: 5 * time.Second,
-		PreserveHost:      true,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       10 * time.Second,
+		ShutdownTimeout:   10 * time.Second,
+		DrainDelay:        10 * time.Second,
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -64,5 +73,14 @@ func (c *Config) validate() error {
 	if c.ReadHeaderTimeout <= 0 {
 		errs = append(errs, errors.New("read_header_timeout debe ser mayor que 0"))
 	}
+
+	if c.ShutdownTimeout+c.DrainDelay >= 30*time.Second {
+		errs = append(errs, fmt.Errorf("shutdown_timeout + drain_delay (%s) debe ser menor que 30s, el límite de ECS", c.ShutdownTimeout+c.DrainDelay))
+	}
+
+	if c.WriteTimeout > c.ShutdownTimeout {
+		errs = append(errs, fmt.Errorf("write_timeout (%s) no puede ser mayor que shutdown_timeout (%s)", c.WriteTimeout, c.ShutdownTimeout))
+	}
+
 	return errors.Join(errs...)
 }
