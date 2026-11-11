@@ -1,5 +1,9 @@
 # guardian-scrapy
 
+![guardian](docs/banner.jpg)
+
+![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go) ![AWS](https://img.shields.io/badge/AWS-ready-FF9900?logo=amazonaws)
+
 Proxy inverso en Go. Recibe HTTP, puntúa cada petición y la reenvía al upstream si el veredicto no llega al umbral de bloqueo. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
 
 ## Arquitectura
