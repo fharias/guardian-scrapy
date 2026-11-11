@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
@@ -61,11 +63,26 @@ func main() {
 		}
 	})
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	go func() {
+		m := http.NewServeMux()
+		m.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(":2112", m); err != nil {
+			logger.Error("servidor de métricas", "err", err)
+		}
+	}()
 	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
-		Addrs: []string{cfg.RedisAddr},
+		Addrs:                 []string{cfg.RedisAddr},
+		DialTimeout:           200 * time.Millisecond,
+		ReadTimeout:           100 * time.Millisecond,
+		WriteTimeout:          100 * time.Millisecond,
+		ContextTimeoutEnabled: true,
+		MaxRetries:            -1,
 	})
 	defer rdb.Close()
-	store := ratelimit.NewRedisStore(rdb, cfg.App, cfg.Rate, cfg.Burst)
+	redisStore := ratelimit.NewRedisStore(rdb, cfg.App, cfg.Rate, cfg.Burst)
+	local := ratelimit.NewMemoryStore(cfg.Rate, cfg.Burst)
+
+	store := ratelimit.NewFailoverStore(redisStore, local, 50*time.Millisecond, 5, 10*time.Second, logger)
 
 	handler := middleware.Chain(proxy,
 		middleware.Init,
@@ -87,6 +104,7 @@ func main() {
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	local.StartJanitor(ctx, time.Minute, logger)
 	defer stop()
 	go func() {
 		log.Printf("guardian escuchando en %s -> %s", srv.Addr, cfg.UpstreamURL)

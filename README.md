@@ -1,23 +1,129 @@
 # guardian-scrapy
 
-Proxy inverso en Go. Recibe HTTP en una dirección local y reenvía cada petición a un upstream, con timeouts, cabeceras `X-Forwarded-*`, comprobaciones de salud y apagado ordenado ante `SIGINT` o `SIGTERM`.
+Proxy inverso en Go. Recibe HTTP, puntúa cada petición y la reenvía al upstream si el veredicto no llega al umbral de bloqueo. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
+
+## Arquitectura
+
+`guardian` escucha en `:8080`. Las rutas de salud salen antes de la cadena de middleware. El resto entra en la cadena y, si el veredicto lo permite, el reverse proxy habla con el upstream. Las métricas de Prometheus van en otro puerto.
+
+```mermaid
+flowchart LR
+  cliente[Cliente HTTP]
+
+  subgraph proxy [guardian]
+    direction TB
+    http8080["HTTP :8080"]
+    salud["GET /healthz y /readyz"]
+    cadena[Cadena de middleware]
+    reverso[Reverse proxy]
+    failover[FailoverStore]
+    memoria[MemoryStore]
+    metricas["Prometheus :2112 /metrics"]
+  end
+
+  valkey[("Valkey :6379")]
+  origen["upstream :9000"]
+
+  cliente --> http8080
+  http8080 --> salud
+  http8080 --> cadena
+  cadena --> failover
+  cadena --> reverso
+  failover --> valkey
+  failover -.-> memoria
+  failover -.-> metricas
+  reverso --> origen
+```
+
+La cadena se ejecuta en este orden. `Logger` envuelve al resto y escribe el veredicto al volver.
+
+```mermaid
+flowchart LR
+  init[Init] --> logger[Logger] --> ua[SuspiciousUA] --> honey[Honeypot] --> limite[RateLimit] --> enforce[Enforce] --> origen[Upstream]
+```
+
+| Pieza | Paquete | Qué hace |
+| --- | --- | --- |
+| Proxy y servidores | `cmd/guardian` | YAML, mux, métricas, Valkey, apagado |
+| Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
+| Configuración | `internal/config` | Carga y validación del YAML |
+| Middleware | `internal/middleware` | Puntuación, honeypots, límite y bloqueo |
+| Veredicto | `internal/verdict` | Score, motivos y decisión de la petición |
+| Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
+
+## Flujo de una petición
+
+`Init` deja el veredicto en `allow` con score 0. Cada señal suma puntos. `Enforce` corta la cadena cuando el score llega a 85 y responde `403` con el cuerpo `acceso denegado`.
+
+| Señal | Puntos | Motivo |
+| --- | --- | --- |
+| `User-Agent` vacío | 90 | `ua_vacio` |
+| `User-Agent` que contiene `curl` | 90 | `ua_herramienta` |
+| Ruta listada en `honeypot_paths` | 50 | `honeypot` |
+| Límite de tasa superado | 100 | `rate_limit` |
+
+Un honeypot solo no bloquea: 50 está por debajo de 85. El `User-Agent` de `curl` y un límite superado sí bloquean por sí solos.
+
+```mermaid
+flowchart TD
+  inicio[Peticion en :8080] --> ruta{Ruta}
+  ruta -->|GET /healthz o /readyz| listo{Proceso listo}
+  listo -->|si| r200[200]
+  listo -->|no| r503[503]
+
+  ruta -->|otra| init["Init: score 0, allow"]
+  init --> ua{User-Agent}
+  ua -->|vacio| p90a["+90 ua_vacio"]
+  ua -->|contiene curl| p90b["+90 ua_herramienta"]
+  ua -->|otro| honey
+  p90a --> honey
+  p90b --> honey
+
+  honey{Ruta honeypot} -->|si| p50["+50 honeypot"]
+  honey -->|no| limite
+  p50 --> limite[Rate limit por IP]
+
+  limite --> circuito{Circuito abierto}
+  circuito -->|si| local[MemoryStore]
+  circuito -->|no| valkey["Valkey, tope 50 ms"]
+  valkey -->|responde| cupo{Hay token}
+  valkey -->|error o timeout| local
+  cupo -->|si| restante[Cabecera X-RateLimit-Remaining]
+  cupo -->|no| p100["+100 rate_limit"]
+  local --> cupoLocal{Hay token local}
+  cupoLocal -->|si| restante
+  cupoLocal -->|no| p100
+
+  restante --> umbral
+  p100 --> umbral{Score de al menos 85}
+  umbral -->|si| r403["403 acceso denegado"]
+  umbral -->|no| origen[Reenvio al upstream]
+  origen -->|el upstream falla| r502["502 upstream no disponible"]
+  r403 --> registro[Logger escribe el veredicto]
+  origen --> registro
+  r502 --> registro
+```
+
+El limitador usa la IP de `RemoteAddr`. Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`.
+
+El log de cada petición reenviada es JSON en stdout: método, ruta, score, decisión, motivos y duración.
 
 ## Qué hay
 
-- **`guardian`**: el proxy. Carga un YAML, valida la configuración y sirve con `httputil.ReverseProxy`.
-- **`upstream`**: servidor de prueba. Responde en texto plano con la ruta, el `Host` y las cabeceras reenviadas. La ruta `/lento` espera 10 segundos antes de responder.
-- **`guardian-config.yml`**: configuración de ejemplo. El upstream de prueba escucha en `:9000` y el YAML apunta a esa dirección.
-
 ```
-cmd/guardian/          binario del proxy
-cmd/upstream/          binario de prueba
-internal/config/       carga y validación del YAML
+cmd/guardian/                 binario del proxy
+cmd/upstream/                 binario de prueba
+internal/config/              carga y validación del YAML
+internal/middleware/          cadena, señales y bloqueo
+internal/ratelimit/           Valkey, memoria y failover
+internal/verdict/             score y decisión
 guardian-config.yml
 ```
 
 ## Requisitos
 
 - Go 1.27 o superior
+- Docker, para el Valkey local
 
 ## Configuración
 
@@ -33,40 +139,66 @@ idle_timeout: 10s
 shutdown_timeout: 20s
 drain_delay: 5s
 preserve_host: true
+honeypot_paths:
+  - "/robots.txt"
+  - "/favicon.ico"
+  - "/admin-oculto"
+app: "shop"
+redis_addr: "localhost:6379"
+rate: 1
+burst: 2
 ```
 
 | Campo | Obligatorio | Por defecto | Descripción |
 | --- | --- | --- | --- |
 | `listen` | no | `:8080` | Dirección en la que escucha el proxy |
 | `upstream` | sí | — | URL completa del destino (`http://host:puerto`) |
-| `read_header_timeout` | no | `5s` | Tiempo máximo para leer las cabeceras del cliente. Debe ser mayor que 0 |
+| `read_header_timeout` | no | `5s` | Tiempo máximo para leer las cabeceras del cliente. Tiene que ser mayor que 0 |
 | `read_timeout` | no | `10s` | Tiempo máximo para leer la petición completa |
 | `write_timeout` | no | `10s` | Tiempo máximo para escribir la respuesta. No puede superar `shutdown_timeout` |
-| `idle_timeout` | no | `10s` | Tiempo máximo de espera de la siguiente petición en una conexión keep-alive |
+| `idle_timeout` | no | `10s` | Espera de la siguiente petición en una conexión keep-alive |
 | `shutdown_timeout` | no | `10s` | Tiempo máximo del apagado para terminar las peticiones en curso |
 | `drain_delay` | no | `10s` | Espera tras dejar de estar listo y antes de cerrar el servidor |
 | `preserve_host` | no | `false` | Si es `true`, el `Host` que ve el upstream es el del cliente |
+| `honeypot_paths` | no | vacío | Rutas que suman 50 puntos |
+| `app` | no | `shop` | Prefijo de las claves del bucket en Valkey |
+| `redis_addr` | no | `localhost:6379` | Dirección de Valkey |
+| `rate` | no | `1` | Tokens por segundo. Tiene que ser mayor que 0 |
+| `burst` | no | `10` | Capacidad del bucket. Tiene que ser mayor que 0 |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host.
 
-Además de los valores por defecto, la carga rechaza la configuración cuando:
+La carga también rechaza la configuración cuando:
 
-- `shutdown_timeout` + `drain_delay` es mayor o igual a 30 segundos (límite de ECS).
+- `shutdown_timeout` + `drain_delay` es mayor o igual a 30 segundos.
 - `write_timeout` es mayor que `shutdown_timeout`.
 
 La variable de entorno `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo.
 
 ## Salud y apagado
 
-`GET /healthz` y `GET /readyz` responden `200` mientras el proceso está listo. El resto de rutas se reenvía al upstream.
+`GET /healthz` y `GET /readyz` responden `200` mientras el proceso está listo. No pasan por la cadena de middleware.
 
-Al recibir `SIGINT` o `SIGTERM`:
+```mermaid
+sequenceDiagram
+  participant SO as SIGINT o SIGTERM
+  participant G as guardian
+  participant C as Peticiones en curso
 
-1. Ambos endpoints pasan a `503`.
-2. El proceso espera `drain_delay`.
-3. Cierra el servidor y deja terminar las peticiones en curso, como máximo durante `shutdown_timeout`.
+  SO->>G: señal
+  G->>G: /healthz y /readyz pasan a 503
+  G->>G: espera drain_delay
+  G->>C: Shutdown durante shutdown_timeout
+  alt terminan a tiempo
+    G->>G: apagado limpio
+  else se agota el plazo
+    G->>G: apagado forzado
+  end
+```
 
-Si ese cierre no termina a tiempo, el proceso registra `apagado forzado` y sale.
+El limitador en memoria limpia cada minuto las claves que ya recuperaron el burst completo. Esa limpieza se detiene con la misma señal.
+
+`GET /metrics` en `:2112` expone las métricas de Prometheus, incluido `guardian_fail_open_total`.
 
 ## Ejecutar
 
@@ -89,17 +221,25 @@ go run ./cmd/guardian
 # go run ./cmd/guardian -config /ruta/guardian-config.yml
 ```
 
-Una petición de ejemplo:
+`curl` sin otro `User-Agent` suma 90 puntos y recibe `403`:
 
 ```bash
-curl -s http://localhost:8080/salud
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/healthz
+curl -s -D - http://localhost:8080/salud
 ```
 
-La respuesta del proxy incluye la ruta, el `Host` y `X-Forwarded-For`, `X-Forwarded-Host` y `X-Forwarded-Proto`. Si el upstream no responde, el proxy devuelve `502` con el cuerpo `upstream no disponible`.
+Con un `User-Agent` de navegador la petición sigue hacia el upstream. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y también responde `403`.
+
+```bash
+curl -s -A "Mozilla/5.0" http://localhost:8080/salud
+curl -s -D - -o /dev/null -A "Mozilla/5.0" http://localhost:8080/salud
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/healthz
+curl -s http://localhost:2112/metrics
+```
+
+La respuesta reenviada incluye la ruta, el `Host` y `X-Forwarded-For`, `X-Forwarded-Host` y `X-Forwarded-Proto`. Si el upstream no responde, el proxy devuelve `502` con el cuerpo `upstream no disponible`.
 
 `/lento` sirve para ver el efecto de los timeouts: el upstream espera 10 segundos antes de escribir la respuesta.
 
 ```bash
-curl -s http://localhost:8080/lento
+curl -s -A "Mozilla/5.0" http://localhost:8080/lento
 ```

@@ -45,3 +45,20 @@ func runContract(t *testing.T, newStore func(t *testing.T) RateStore) {
 func TestMemoryStoreContract(t *testing.T) {
 	runContract(t, func(t *testing.T) RateStore { return NewMemoryStore(1, 2) })
 }
+
+func TestMemoryStoreCleanup(t *testing.T) {
+	s := NewMemoryStore(10, 2)
+	ctx := context.Background()
+	s.Allow(ctx, "activa")
+	s.Allow(ctx, "activa")
+	s.Allow(ctx, "inactiva")
+	time.Sleep(250 * time.Millisecond)
+	s.Allow(ctx, "activa")
+	s.Allow(ctx, "activa")
+	if n := s.Cleanup(); n != 1 {
+		t.Fatalf("borró %d, quiero 1 (solo la inactiva)", n)
+	}
+	if _, ok := s.limiters["activa"]; !ok {
+		t.Fatal("no debió borrar la clave activa")
+	}
+}
