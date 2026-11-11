@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,11 +24,14 @@ type Config struct {
 	PreserveHost      bool          `yaml:"preserve_host"`
 	HoneypotPaths     []string      `yaml:"honeypot_paths"`
 
-	App         string   `yaml:"app"`
-	RedisAddr   string   `yaml:"redis_addr"`
-	Rate        float64  `yaml:"rate"`
-	Burst       int      `yaml:"burst"`
-	UpstreamURL *url.URL `yaml:"-"`
+	App                 string   `yaml:"app"`
+	RedisAddr           string   `yaml:"redis_addr"`
+	Rate                float64  `yaml:"rate"`
+	Burst               int      `yaml:"burst"`
+	TrustedProxies      []string `yaml:"trusted_proxies"`
+	XForwardedForHeader string   `yaml:"x_forwarded_for_header"`
+	ProxyProtocol       bool     `yaml:"proxy_protocol"`
+	UpstreamURL         *url.URL `yaml:"-"`
 }
 
 func Load(path string) (*Config, error) {
@@ -96,6 +100,13 @@ func (c *Config) validate() error {
 	}
 	if c.Burst <= 0 {
 		errs = append(errs, errors.New("burst debe ser mayor que 1"))
+	}
+
+	if len(c.TrustedProxies) > 0 {
+		_, err := clientip.New(c.TrustedProxies, c.XForwardedForHeader)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error al crear el resolver de clientip: %w", err))
+		}
 	}
 
 	return errors.Join(errs...)

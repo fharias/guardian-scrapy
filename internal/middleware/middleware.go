@@ -2,12 +2,13 @@ package middleware
 
 import (
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
@@ -36,6 +37,7 @@ func Logger(log *slog.Logger) Middleware {
 				v = &verdict.Verdict{}
 			}
 			log.Info("request",
+				"client_ip", v.ClientIP.String(),
 				"method", r.Method,
 				"path", r.URL.Path,
 				"score", v.Score,
@@ -101,10 +103,10 @@ func RateLimit(store ratelimit.RateStore, points int, log *slog.Logger) Middlewa
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			v := verdict.From(r.Context())
-			ip, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				ip = r.RemoteAddr
+			if v == nil || v.ClientIP == (netip.Addr{}) {
+				v = &verdict.Verdict{}
 			}
+			ip := v.ClientIP.String()
 			res, err := store.Allow(r.Context(), ip)
 			switch {
 			case err != nil:
@@ -113,6 +115,17 @@ func RateLimit(store ratelimit.RateStore, points int, log *slog.Logger) Middlewa
 				v.Add(points, "rate_limit")
 			default:
 				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(res.Remaining))
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func ClientIP(res *clientip.Resolver) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil {
+				v.ClientIP = res.ClientIP(r)
 			}
 			next.ServeHTTP(w, r)
 		})

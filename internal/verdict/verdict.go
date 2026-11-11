@@ -1,6 +1,9 @@
 package verdict
 
-import "context"
+import (
+	"context"
+	"net/netip"
+)
 
 type Decision int
 
@@ -23,6 +26,7 @@ func (d Decision) String() string {
 }
 
 type Verdict struct {
+	ClientIP netip.Addr
 	Score    int
 	Reasons  []string
 	Decision Decision

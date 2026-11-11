@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -13,11 +15,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pires/go-proxyproto"
+
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/fharias/guardian-scrapy/internal/verdict"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -33,10 +39,13 @@ func main() {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(cfg.UpstreamURL)
+			pr.SetXForwarded()
+			if v := verdict.From(pr.In.Context()); v != nil && v.ClientIP.IsValid() {
+				pr.Out.Header.Set("X-Forwarded-For", v.ClientIP.String())
+			}
 			if cfg.PreserveHost {
 				pr.Out.Host = pr.In.Host
 			}
-			pr.SetXForwarded()
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("error hacia upstream: %v", err)
@@ -84,8 +93,15 @@ func main() {
 
 	store := ratelimit.NewFailoverStore(redisStore, local, 50*time.Millisecond, 5, 10*time.Second, logger)
 
+	clientipResolver, err := clientip.New(cfg.TrustedProxies, cfg.XForwardedForHeader)
+	if err != nil {
+		logger.Error("error al crear el resolver de clientip", "err", err)
+		os.Exit(1)
+	}
+
 	handler := middleware.Chain(proxy,
 		middleware.Init,
+		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(90),
 		middleware.Honeypot(50, cfg.HoneypotPaths...),
@@ -106,10 +122,27 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	local.StartJanitor(ctx, time.Minute, logger)
 	defer stop()
+	logger.Info("listener", "addr", cfg.Listen, "proxy_protocol", cfg.ProxyProtocol, "trusted", cfg.TrustedProxies)
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		logger.Error("no pude escuchar", "err", err)
+		os.Exit(1)
+	}
+	if cfg.ProxyProtocol {
+		policy, err := proxyproto.TrustProxyHeaderFromRanges(cfg.TrustedProxies)
+		if err != nil {
+			logger.Error("proxy protocol", "err", err)
+			os.Exit(1)
+		}
+		ln = &proxyproto.Listener{
+			Listener:          ln,
+			ConnPolicy:        policy,
+			ReadHeaderTimeout: 2 * time.Second,
+		}
+	}
 	go func() {
-		log.Printf("guardian escuchando en %s -> %s", srv.Addr, cfg.UpstreamURL)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("error al escuchar: %v", err)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("servidor", "err", err)
 		}
 	}()
 
