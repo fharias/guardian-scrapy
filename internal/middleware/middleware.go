@@ -2,10 +2,13 @@ package middleware
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
 
@@ -88,6 +91,28 @@ func Honeypot(points int, paths ...string) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if v := verdict.From(r.Context()); v != nil && trap[r.URL.Path] {
 				v.Add(points, "honeypot")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func RateLimit(store ratelimit.RateStore, points int, log *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			v := verdict.From(r.Context())
+			ip, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				ip = r.RemoteAddr
+			}
+			res, err := store.Allow(r.Context(), ip)
+			switch {
+			case err != nil:
+				log.Warn("ratelimit no disponible", "err", err)
+			case !res.Allowed && v != nil:
+				v.Add(points, "rate_limit")
+			default:
+				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(res.Remaining))
 			}
 			next.ServeHTTP(w, r)
 		})

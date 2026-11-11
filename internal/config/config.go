@@ -22,7 +22,12 @@ type Config struct {
 	DrainDelay        time.Duration `yaml:"drain_delay"`
 	PreserveHost      bool          `yaml:"preserve_host"`
 	HoneypotPaths     []string      `yaml:"honeypot_paths"`
-	UpstreamURL       *url.URL      `yaml:"-"`
+
+	App         string   `yaml:"app"`
+	RedisAddr   string   `yaml:"redis_addr"`
+	Rate        float64  `yaml:"rate"`
+	Burst       int      `yaml:"burst"`
+	UpstreamURL *url.URL `yaml:"-"`
 }
 
 func Load(path string) (*Config, error) {
@@ -39,6 +44,10 @@ func Load(path string) (*Config, error) {
 		IdleTimeout:       10 * time.Second,
 		ShutdownTimeout:   10 * time.Second,
 		DrainDelay:        10 * time.Second,
+		RedisAddr:         "localhost:6379",
+		App:               "shop",
+		Rate:              1,
+		Burst:             10,
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -80,6 +89,13 @@ func (c *Config) validate() error {
 
 	if c.WriteTimeout > c.ShutdownTimeout {
 		errs = append(errs, fmt.Errorf("write_timeout (%s) no puede ser mayor que shutdown_timeout (%s)", c.WriteTimeout, c.ShutdownTimeout))
+	}
+
+	if c.Rate <= 0 {
+		errs = append(errs, errors.New("rate debe ser mayor que 0"))
+	}
+	if c.Burst <= 0 {
+		errs = append(errs, errors.New("burst debe ser mayor que 1"))
 	}
 
 	return errors.Join(errs...)

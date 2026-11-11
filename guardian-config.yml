@@ -11,3 +11,7 @@ honeypot_paths:
   - "/robots.txt"
   - "/favicon.ico"
   - "/admin-oculto"
+app: "shop"
+redis_addr: "localhost:6379"
+rate: 1
+burst: 2

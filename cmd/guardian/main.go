@@ -15,6 +15,8 @@ import (
 
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
+	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -59,11 +61,18 @@ func main() {
 		}
 	})
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
+		Addrs: []string{cfg.RedisAddr},
+	})
+	defer rdb.Close()
+	store := ratelimit.NewRedisStore(rdb, cfg.App, cfg.Rate, cfg.Burst)
+
 	handler := middleware.Chain(proxy,
 		middleware.Init,
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(90),
 		middleware.Honeypot(50, cfg.HoneypotPaths...),
+		middleware.RateLimit(store, 100, logger),
 		middleware.Enforce(85),
 	)
 	mux.Handle("/", handler)

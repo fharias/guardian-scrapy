@@ -70,6 +70,12 @@ Si ese cierre no termina a tiempo, el proceso registra `apagado forzado` y sale.
 
 ## Ejecutar
 
+Valkey, en segundo plano y publicado en el puerto `6379`:
+
+```bash
+docker run -d --name valkey -p 6379:6379 valkey/valkey:8
+```
+
 En una terminal, el upstream de prueba:
 
 ```bash
