@@ -23,6 +23,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 	"github.com/redis/go-redis/v9"
 )
@@ -98,16 +99,22 @@ func main() {
 		logger.Error("error al crear el resolver de clientip", "err", err)
 		os.Exit(1)
 	}
+	scorer, err := scoring.New(cfg.Scoring)
+	if err != nil {
+		logger.Error("scoring", "err", err)
+		os.Exit(1)
+	}
 
 	handler := middleware.Chain(proxy,
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
-		middleware.SuspiciousUA(90),
-		middleware.Fingerprint(30),
-		middleware.Honeypot(50, cfg.HoneypotPaths...),
-		middleware.RateLimit(store, 100, logger),
-		middleware.Enforce(85),
+		middleware.SuspiciousUA(),
+		middleware.Fingerprint(),
+		middleware.Honeypot(cfg.HoneypotPaths...),
+		middleware.RateLimit(store, logger),
+		middleware.Score(scorer),
+		middleware.Enforce(),
 	)
 	mux.Handle("/", handler)
 

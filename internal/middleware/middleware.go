@@ -11,6 +11,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
 
@@ -53,15 +54,14 @@ func Logger(log *slog.Logger) Middleware {
 }
 
 // Calcula el fingerprint de la solicitud y lo agrega al score
-func Fingerprint(weight int) Middleware {
+func Fingerprint() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if v := verdict.From(r.Context()); v != nil {
 				fp := fingerprint.Compute(r.Header)
 				v.Fingerprint = fp.Hash
 				if len(fp.Missing) > 0 {
-					v.Score += weight
-					v.Reasons = append(v.Reasons, "headers_incompletos")
+					v.Signals.HeadersIncomplete = true
 				}
 			}
 			next.ServeHTTP(w, r)
@@ -70,31 +70,27 @@ func Fingerprint(weight int) Middleware {
 }
 
 // Verifica si la User-Agent es sospechosa
-func SuspiciousUA(points int) Middleware {
+func SuspiciousUA() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if v := verdict.From(r.Context()); v != nil {
-				ua := strings.ToLower(r.UserAgent())
-				switch {
-				case ua == "":
-					v.Add(points, "ua_vacio")
-				case strings.Contains(ua, "curl"):
-					v.Add(points, "ua_herramienta")
-				}
+			if v := verdict.From(r.Context()); v != nil && isToolUA(r.UserAgent()) {
+				v.Signals.UATool = true
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
+func isToolUA(ua string) bool {
+	return ua == "" || strings.Contains(ua, "curl")
+}
+
 // Bloquea la solicitud si el score es mayor o igual a blockAt
-func Enforce(blockAt int) Middleware {
+func Enforce() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			v := verdict.From(r.Context())
-			if v != nil && v.Score >= blockAt {
-				v.Decision = verdict.Block
-				http.Error(w, "acceso denegado", http.StatusForbidden)
+			if v := verdict.From(r.Context()); v != nil && v.Decision == verdict.Block {
+				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -103,7 +99,7 @@ func Enforce(blockAt int) Middleware {
 }
 
 // Bloqua honeypots (rutas que no existen)
-func Honeypot(points int, paths ...string) Middleware {
+func Honeypot(paths ...string) Middleware {
 	trap := make(map[string]bool)
 	for _, path := range paths {
 		trap[path] = true
@@ -112,14 +108,14 @@ func Honeypot(points int, paths ...string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if v := verdict.From(r.Context()); v != nil && trap[r.URL.Path] {
-				v.Add(points, "honeypot")
+				v.Signals.Honeypot = true
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-func RateLimit(store ratelimit.RateStore, points int, log *slog.Logger) Middleware {
+func RateLimit(store ratelimit.RateStore, log *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			v := verdict.From(r.Context())
@@ -132,7 +128,7 @@ func RateLimit(store ratelimit.RateStore, points int, log *slog.Logger) Middlewa
 			case err != nil:
 				log.Warn("ratelimit no disponible", "err", err)
 			case !res.Allowed && v != nil:
-				v.Add(points, "rate_limit")
+				v.Signals.RateExceeded = true
 			default:
 				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(res.Remaining))
 			}
@@ -146,6 +142,17 @@ func ClientIP(res *clientip.Resolver) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if v := verdict.From(r.Context()); v != nil {
 				v.ClientIP = res.ClientIP(r)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func Score(s *scoring.Scorer) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil {
+				v.Score, v.Reasons, v.Decision = s.Evaluate(v.Signals)
 			}
 			next.ServeHTTP(w, r)
 		})

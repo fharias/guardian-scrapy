@@ -25,9 +25,18 @@ func (d Decision) String() string {
 	return "unknown"
 }
 
+type Signals struct {
+	UATool            bool
+	HeadersIncomplete bool
+	Honeypot          bool
+	RateExceeded      bool
+	BrowserRatio      *float64
+}
+
 type Verdict struct {
 	ClientIP    netip.Addr
 	Score       int
+	Signals     Signals
 	Reasons     []string
 	Decision    Decision
 	Fingerprint string

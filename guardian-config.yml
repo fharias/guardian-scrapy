@@ -21,3 +21,14 @@ trusted_proxies:
   - "127.0.0.0/8"
 x_forwarded_for_header: "X-Forwarded-For"
 proxy_protocol: false
+scoring:
+  weights:
+    ua_tool: 0
+    headers_incomplete: 30
+    honeypot: 50
+    rate_exceeded: 100
+    low_browser_ratio: 15
+  browser_ratio_min: 0.3
+  thresholds:
+    challenge: 40
+    block: 85

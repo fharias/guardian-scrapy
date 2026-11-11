@@ -4,7 +4,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go) ![AWS](https://img.shields.io/badge/AWS-ready-FF9900?logo=amazonaws)
 
-Proxy inverso en Go. Resuelve la IP del cliente, puntúa cada petición y la reenvía al upstream si el veredicto no llega al umbral de bloqueo. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
+Proxy inverso en Go. Resuelve la IP del cliente, calcula una huella de las cabeceras, puntúa cada petición y la reenvía al upstream si el veredicto no llega al umbral de bloqueo. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
 
 ## Arquitectura
 
@@ -45,7 +45,7 @@ La cadena se ejecuta en este orden. `Logger` envuelve al resto y escribe el vere
 
 ```mermaid
 flowchart LR
-  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> honey[Honeypot] --> limite[RateLimit] --> enforce[Enforce] --> origen[Upstream]
+  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> honey[Honeypot] --> limite[RateLimit] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
@@ -54,8 +54,9 @@ flowchart LR
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
 | Configuración | `internal/config` | Carga y validación del YAML |
 | IP del cliente | `internal/clientip` | Elige la IP real a partir del peer y de la cabecera configurada |
-| Middleware | `internal/middleware` | IP, puntuación, honeypots, límite y bloqueo |
-| Veredicto | `internal/verdict` | IP, score, motivos y decisión de la petición |
+| Huella | `internal/fingerprint` | Resume las cabeceras y detecta las que faltan en un navegador |
+| Middleware | `internal/middleware` | IP, huella, puntuación, honeypots, límite y bloqueo |
+| Veredicto | `internal/verdict` | IP, huella, score, motivos y decisión de la petición |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
 ### IP del cliente
@@ -77,6 +78,14 @@ flowchart TD
 
 Con `proxy_protocol` activo, la IP de la conexión es la que trae la cabecera PROXY, no la del socket. Solo se acepta si el peer está en `trusted_proxies`; cualquier otro origen se rechaza.
 
+### Huella de cabeceras
+
+`Fingerprint` guarda en el veredicto los primeros 16 caracteres hexadecimales de un SHA-256. El texto que se resume lleva, en este orden, el valor normalizado de `User-Agent`, `Accept`, `Accept-Language`, `Accept-Encoding`, `Sec-Ch-Ua` y `Sec-Ch-Ua-Platform`, y después la lista ordenada de nombres de cabecera. La normalización pasa el valor a minúsculas y colapsa los espacios.
+
+Estas cabeceras no entran en la lista de nombres, así que cambiarlas no cambia la huella: `Cookie`, `Content-Length`, `Content-Type`, `Referer`, `Authorization`, `Cache-Control`, `Pragma`, `If-None-Match`, `If-Modified-Since`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded` y `X-Amzn-Trace-Id`.
+
+Si el `User-Agent` contiene `Mozilla/` y falta `Accept`, `Accept-Language` o `Accept-Encoding`, la petición suma 30 puntos con el motivo `headers_incompletos`. La comparación busca ese texto tal cual, con la `M` mayúscula. Esos 30 puntos no alcanzan el umbral de 85.
+
 ## Flujo de una petición
 
 `Init` deja el veredicto en `allow` con score 0. Cada señal suma puntos. `Enforce` corta la cadena cuando el score llega a 85 y responde `403` con el cuerpo `acceso denegado`.
@@ -85,10 +94,11 @@ Con `proxy_protocol` activo, la IP de la conexión es la que trae la cabecera PR
 | --- | --- | --- |
 | `User-Agent` vacío | 90 | `ua_vacio` |
 | `User-Agent` que contiene `curl` | 90 | `ua_herramienta` |
+| `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` o `Accept-Encoding` | 30 | `headers_incompletos` |
 | Ruta listada en `honeypot_paths` | 50 | `honeypot` |
 | Límite de tasa superado | 100 | `rate_limit` |
 
-Un honeypot solo no bloquea: 50 está por debajo de 85. El `User-Agent` de `curl` y un límite superado sí bloquean por sí solos.
+Un honeypot o unas cabeceras incompletas no bloquean por sí solos: 50 y 30 están por debajo de 85. El `User-Agent` de `curl` y un límite superado sí bloquean por sí solos.
 
 ```mermaid
 flowchart TD
@@ -102,9 +112,13 @@ flowchart TD
   ipres --> ua{User-Agent}
   ua -->|vacio| p90a["+90 ua_vacio"]
   ua -->|contiene curl| p90b["+90 ua_herramienta"]
-  ua -->|otro| honey
-  p90a --> honey
-  p90b --> honey
+  ua -->|otro| fp
+  p90a --> fp
+  p90b --> fp
+
+  fp{"Mozilla/ sin Accept, Accept-Language o Accept-Encoding"} -->|si| p30["+30 headers_incompletos"]
+  fp -->|no| honey
+  p30 --> honey
 
   honey{Ruta honeypot} -->|si| p50["+50 honeypot"]
   honey -->|no| limite
@@ -133,7 +147,7 @@ flowchart TD
 
 Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, método, ruta, score, decisión, motivos y duración.
+El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `fingerprint`, método, ruta, score, decisión, motivos y duración.
 
 ## Qué hay
 
@@ -142,9 +156,10 @@ cmd/guardian/                 binario del proxy
 cmd/upstream/                 binario de prueba
 internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
+internal/fingerprint/         huella de cabeceras
 internal/middleware/          cadena, señales y bloqueo
 internal/ratelimit/           Valkey, memoria y failover
-internal/verdict/             IP, score y decisión
+internal/verdict/             IP, huella, score y decisión
 guardian-config.yml
 ```
 
@@ -180,7 +195,7 @@ trusted_proxies:
   - "::1/128"
   - "127.0.0.0/8"
 x_forwarded_for_header: "X-Forwarded-For"
-proxy_protocol: true
+proxy_protocol: false
 ```
 
 | Campo | Obligatorio | Por defecto | Descripción |
@@ -258,7 +273,7 @@ go run ./cmd/guardian
 # go run ./cmd/guardian -config /ruta/guardian-config.yml
 ```
 
-El `guardian-config.yml` del repositorio deja `proxy_protocol` en `true` y trata a `127.0.0.0/8` como proxy de confianza. Un `curl` directo a localhost no envía la cabecera PROXY, así que el listener rechaza la conexión. Para estas pruebas locales, pon `proxy_protocol: false`.
+El `guardian-config.yml` del repositorio deja `proxy_protocol` en `false`, así que estas pruebas aceptan un `curl` directo. Si se activa, el listener exige la cabecera PROXY a `127.0.0.0/8` y rechaza esa misma conexión.
 
 `curl` sin otro `User-Agent` suma 90 puntos y recibe `403`:
 
@@ -266,7 +281,7 @@ El `guardian-config.yml` del repositorio deja `proxy_protocol` en `true` y trata
 curl -s -D - http://localhost:8080/salud
 ```
 
-Con un `User-Agent` de navegador la petición sigue hacia el upstream. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y también responde `403`. Desde localhost, y sin una cabecera reenviada por un proxy de confianza, la IP limitada es `127.0.0.1`.
+Con un `User-Agent` que contiene `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Encoding`, la petición suma 30 puntos y sigue hacia el upstream. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y responde `403`. Desde localhost, y sin una cabecera reenviada por un proxy de confianza, la IP limitada es `127.0.0.1`.
 
 ```bash
 curl -s -A "Mozilla/5.0" http://localhost:8080/salud

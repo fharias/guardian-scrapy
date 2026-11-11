@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
+	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"gopkg.in/yaml.v3"
 )
 
@@ -24,14 +25,15 @@ type Config struct {
 	PreserveHost      bool          `yaml:"preserve_host"`
 	HoneypotPaths     []string      `yaml:"honeypot_paths"`
 
-	App                 string   `yaml:"app"`
-	RedisAddr           string   `yaml:"redis_addr"`
-	Rate                float64  `yaml:"rate"`
-	Burst               int      `yaml:"burst"`
-	TrustedProxies      []string `yaml:"trusted_proxies"`
-	XForwardedForHeader string   `yaml:"x_forwarded_for_header"`
-	ProxyProtocol       bool     `yaml:"proxy_protocol"`
-	UpstreamURL         *url.URL `yaml:"-"`
+	App                 string         `yaml:"app"`
+	RedisAddr           string         `yaml:"redis_addr"`
+	Rate                float64        `yaml:"rate"`
+	Burst               int            `yaml:"burst"`
+	TrustedProxies      []string       `yaml:"trusted_proxies"`
+	XForwardedForHeader string         `yaml:"x_forwarded_for_header"`
+	ProxyProtocol       bool           `yaml:"proxy_protocol"`
+	Scoring             scoring.Config `yaml:"scoring"`
+	UpstreamURL         *url.URL       `yaml:"-"`
 }
 
 func Load(path string) (*Config, error) {
