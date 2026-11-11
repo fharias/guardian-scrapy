@@ -104,6 +104,7 @@ func main() {
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(90),
+		middleware.Fingerprint(30),
 		middleware.Honeypot(50, cfg.HoneypotPaths...),
 		middleware.RateLimit(store, 100, logger),
 		middleware.Enforce(85),

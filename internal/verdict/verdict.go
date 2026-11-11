@@ -26,10 +26,11 @@ func (d Decision) String() string {
 }
 
 type Verdict struct {
-	ClientIP netip.Addr
-	Score    int
-	Reasons  []string
-	Decision Decision
+	ClientIP    netip.Addr
+	Score       int
+	Reasons     []string
+	Decision    Decision
+	Fingerprint string
 }
 
 func (v *Verdict) Add(points int, reason string) {

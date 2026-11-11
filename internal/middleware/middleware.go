@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
+	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
@@ -38,6 +39,8 @@ func Logger(log *slog.Logger) Middleware {
 			}
 			log.Info("request",
 				"client_ip", v.ClientIP.String(),
+
+				"fingerprint", v.Fingerprint,
 				"method", r.Method,
 				"path", r.URL.Path,
 				"score", v.Score,
@@ -45,6 +48,23 @@ func Logger(log *slog.Logger) Middleware {
 				"reasons", v.Reasons,
 				"dur_ms", time.Since(start).Milliseconds(),
 			)
+		})
+	}
+}
+
+// Calcula el fingerprint de la solicitud y lo agrega al score
+func Fingerprint(weight int) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil {
+				fp := fingerprint.Compute(r.Header)
+				v.Fingerprint = fp.Hash
+				if len(fp.Missing) > 0 {
+					v.Score += weight
+					v.Reasons = append(v.Reasons, "headers_incompletos")
+				}
+			}
+			next.ServeHTTP(w, r)
 		})
 	}
 }
