@@ -21,6 +21,9 @@
 go.work
 go.work.sum
 
-bin/
+bin/*
+build/*
+dist/*
+vendor/*
 # env file
 .env
