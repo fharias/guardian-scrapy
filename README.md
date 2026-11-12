@@ -8,7 +8,7 @@ Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición 
 
 ## Arquitectura
 
-`guardian` escucha en `:8080`. Con `proxy_protocol` activo, el listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. `POST /__guardian/verify` canjea el desafío. El resto de las rutas entra en la cadena protegida. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto.
+`guardian` escucha en `:8080`. Con `proxy_protocol` activo, el listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. `GET /healthz`, `GET /readyz` y `POST /__guardian/verify` salen antes de la cadena protegida. El resto entra en esa cadena. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto.
 
 ```mermaid
 flowchart LR
@@ -18,6 +18,7 @@ flowchart LR
     direction TB
     listener["Listener :8080"]
     pp["Cabecera PROXY si proxy_protocol"]
+    salud["GET /healthz y /readyz"]
     verify["POST /__guardian/verify"]
     cadena[Cadena protegida]
     reglas[Reglas y bots]
@@ -33,6 +34,7 @@ flowchart LR
 
   cliente --> listener
   listener --> pp
+  pp --> salud
   pp --> verify
   pp --> cadena
   cadena --> reglas
@@ -166,6 +168,10 @@ La cadena no asigna la señal de ratio de navegador. El peso `low_browser_ratio`
 ```mermaid
 flowchart TD
   inicio[Peticion en :8080] --> ruta{Ruta}
+  ruta -->|GET /healthz| hz{Proceso listo}
+  hz -->|si| h200[200]
+  hz -->|no| h503[503]
+  ruta -->|GET /readyz| r200[200]
   ruta -->|POST /__guardian/verify| canje["Canje: cookie guardian_pass y 303"]
   ruta -->|otra| init["Init: score 0, allow"]
   init --> ipres[Resolver la IP del cliente]
@@ -333,7 +339,7 @@ La carga también rechaza la configuración cuando:
 
 ## Salud y apagado
 
-`cmd/guardian` prepara `GET /healthz` y `GET /readyz`, que responderían `200` mientras el proceso está listo y `503` después de la señal. Ese mux no es el handler del servidor: el listener solo distingue `POST /__guardian/verify` del resto, así que esas dos rutas entran hoy en la cadena protegida.
+`GET /healthz` y `GET /readyz` no pasan por la cadena protegida. Mientras el proceso está listo, las dos responden `200`. Después de `SIGINT` o `SIGTERM`, `/healthz` responde `503`. `/readyz` no escribe un estado en ese tramo, y la respuesta que completa el servidor sigue siendo `200`.
 
 ```mermaid
 sequenceDiagram
@@ -342,7 +348,7 @@ sequenceDiagram
   participant C as Peticiones en curso
 
   SO->>G: señal
-  G->>G: marca el proceso como no listo
+  G->>G: /healthz pasa a 503
   G->>G: espera drain_delay
   G->>C: Shutdown durante shutdown_timeout
   alt terminan a tiempo
@@ -398,6 +404,8 @@ Un `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Enco
 ```bash
 curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/salud
 curl -s -D - -o /dev/null -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/admin-oculto
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/healthz
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/readyz
 curl -s http://localhost:2112/metrics
 ```
 
