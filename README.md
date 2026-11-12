@@ -1,10 +1,10 @@
-# guardian-scrapy
+# Guardian - Enterprise Anti-scraping reverse proxy
 
 ![guardian](docs/banner.jpg)
 
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go) ![AWS](https://img.shields.io/badge/AWS-ready-FF9900?logo=amazonaws)
 
-Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición y las convierte en `allow`, `challenge` o `block`. `block` responde `403`. `challenge` pide una prueba de trabajo y, si sale bien, deja una cookie de pase. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
+Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición y las convierte en `allow`, `challenge` o `block`. En modo `enforce`, `block` responde `403` y `challenge` pide una prueba de trabajo. En modo `monitor`, esa misma decisión queda en el log y la petición sigue. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
 
 ## Arquitectura
 
@@ -65,6 +65,7 @@ flowchart LR
 | Bots | `internal/goodbot` | Comprueba por DNS los user-agent que dicen ser un bot conocido |
 | Puntaje | `internal/scoring` | Convierte las señales en score y decisión |
 | Desafío | `internal/challenge` | Prueba de trabajo, tokens HMAC y pase firmado |
+| Modos | `internal/policy` | Elige `monitor` o `enforce` según el prefijo más largo |
 | Middleware | `internal/middleware` | Cadena, señales, página de desafío y corte en `block` |
 | Veredicto | `internal/verdict` | IP, huella, señales, score y decisión |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
@@ -151,7 +152,11 @@ Con el YAML de ejemplo los pesos y los umbrales son estos:
 
 `ip_denegada` y `ruta_privada` no suman un peso: el score queda en el umbral de `block` y la decisión es `block`, también si el bot estaba verificado. Un bot verificado, sin esas denegaciones, queda en `allow` con score 0 aunque haya visitado un honeypot.
 
-`Enforce` responde `403` con el cuerpo `acceso denegado` cuando la decisión es `block`. Un pase no cambia ese resultado.
+`Enforce` mira el modo de la ruta antes de actuar. El modo es el de `modes.routes` cuyo prefijo es el más largo y coincide con la ruta. Si ninguno coincide, usa `modes.default`. Un prefijo coincide cuando la ruta es igual o continúa con `/`. `/api` cubre `/api` y `/api/precios`, y no cubre `/apiv2`. `/api/checkout` gana sobre `/api` en `/api/checkout/pagar`.
+
+En `monitor`, si la decisión no es `allow` y no hay `ip_denegada` ni `ruta_privada`, la petición sigue al upstream con `shadow` en verdadero. El log conserva el score y la decisión. `ip_denegada` y `ruta_privada` se aplican también en `monitor`.
+
+En `enforce`, `block` responde `403` con el cuerpo `acceso denegado`. Un pase no cambia ese resultado.
 
 Cuando la decisión es `challenge`, busca la cookie `guardian_pass`. Si el pase está firmado, vigente y atado a la misma IP y a la misma huella, agrega el motivo `pase_valido` y sigue al upstream. Si no hay pase, responde `403` con una página HTML que resuelve en el navegador una prueba de trabajo SHA-256: busca un nonce cuyo hash de `semilla + nonce` tenga al menos `challenge.difficulty` bits en cero a la izquierda.
 
@@ -197,7 +202,9 @@ flowchart TD
 
   restante --> score[Score]
   p100 --> score
-  score --> decision{Decision}
+  score --> modo{Monitor sin ip_denegada ni ruta_privada y decision distinta de allow}
+  modo -->|si, shadow| origen
+  modo -->|no| decision{Decision}
   decision -->|block| r403["403 acceso denegado"]
   decision -->|challenge sin pase| pagina["403 pagina de prueba de trabajo"]
   decision -->|allow o pase valido| origen["Reenvio al upstream con esa IP en X-Forwarded-For"]
@@ -210,7 +217,7 @@ flowchart TD
 
 Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `fingerprint`, método, ruta, score, decisión, motivos y duración.
+El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración.
 
 ## Qué hay
 
@@ -222,7 +229,8 @@ internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
 internal/fingerprint/         huella de cabeceras
 internal/goodbot/             verificación DNS de bots conocidos
-internal/middleware/          cadena, señales y corte
+internal/middleware/          cadena, señales, desafío y modo
+internal/policy/              monitor o enforce por prefijo
 internal/ratelimit/           Valkey, memoria y failover
 internal/rules/               honeypots, denegaciones y rutas
 internal/scoring/             pesos, umbrales y decisión
@@ -280,7 +288,7 @@ rules:
   deny_cidrs: ["198.51.100.0/24"]
   routes:
     - prefix: /interno
-      allow_cidrs: ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
+      allow_cidrs: ["10.0.0.0/8", "127.0.0.1/32"]
 good_bots:
   - name: googlebot
     ua_contains: Googlebot
@@ -292,6 +300,15 @@ challenge:
   difficulty: 16
   ttl: 2m
   pass_ttl: 1h
+modes:
+  default: enforce
+  routes:
+    - prefix: /api
+      mode: monitor
+    - prefix: /api/checkout
+      mode: enforce
+    - prefix: /interno
+      mode: monitor
 ```
 
 | Campo | Obligatorio | Por defecto | Descripción |
@@ -324,8 +341,10 @@ challenge:
 | `challenge.difficulty` | sí | — | Bits en cero que exige la prueba de trabajo. Tiene que estar entre 8 y 24 |
 | `challenge.ttl` | no | `0s` | Vigencia del token del desafío |
 | `challenge.pass_ttl` | no | `0s` | Vigencia de la cookie `guardian_pass` |
+| `modes.default` | sí | — | `monitor` o `enforce` cuando ningún prefijo coincide |
+| `modes.routes` | no | vacío | Prefijos con su modo. Gana el más largo. No se pueden repetir |
 
-Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` tiene que empezar por `/`.
+Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
 La carga también rechaza la configuración cuando:
 
@@ -334,6 +353,7 @@ La carga también rechaza la configuración cuando:
 - `scoring.thresholds.challenge` o `block` no son mayores que 0, o `challenge` no es menor que `block`.
 - `scoring.browser_ratio_min` está fuera del intervalo de 0 a 1.
 - `challenge.difficulty` está fuera del intervalo de 8 a 24.
+- `modes.default` está vacío, no es `monitor` ni `enforce`, o dos rutas quedan con el mismo prefijo.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase.
 
@@ -399,7 +419,9 @@ curl -s -D - http://localhost:8080/salud
 
 Un `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Encoding` suma 30 puntos y sigue hacia el upstream. Con esas tres cabeceras el score queda en 0. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y responde `403`. Desde localhost, y sin una cabecera reenviada por un proxy de confianza, la IP limitada es `127.0.0.1`.
 
-`/admin-oculto` suma 50 puntos. La decisión es `challenge`: sin la cookie `guardian_pass` la respuesta es `403` y el HTML de la prueba de trabajo. `curl` no ejecuta ese JavaScript. `/interno` desde una IP fuera de `10.0.0.0/8`, `127.0.0.1` y `::1` responde `403` por `ruta_privada`.
+`/admin-oculto` suma 50 puntos y el modo por defecto es `enforce`. La decisión es `challenge`: sin la cookie `guardian_pass` la respuesta es `403` y el HTML de la prueba de trabajo. `curl` no ejecuta ese JavaScript.
+
+`/api` está en `monitor`, así que un `curl` a `/api/precios` llega al upstream y el log marca `shadow`. `/api/checkout` está en `enforce` y ese mismo `curl` recibe `403`. `/interno` también está en `monitor`, pero una IP fuera de `10.0.0.0/8` y `127.0.0.1` sigue recibiendo `403` por `ruta_privada`.
 
 ```bash
 curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/salud
