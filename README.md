@@ -54,17 +54,17 @@ La cadena se ejecuta en este orden. `Logger` envuelve al resto y escribe el vere
 
 ```mermaid
 flowchart LR
-  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
 | --- | --- | --- |
 | Proxy y servidores | `cmd/guardian` | YAML, HTTP, HTTPS, PROXY protocol, métricas, Valkey y apagado |
-| ClientHello | `internal/tlshello` | Foto del saludo TLS y una línea `tls_hello` por conexión |
+| ClientHello | `internal/tlshello` | Foto del saludo TLS, JA4 y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
 | Configuración | `internal/config` | Carga y validación del YAML |
 | IP del cliente | `internal/clientip` | Elige la IP real a partir del peer y de la cabecera configurada |
-| Huella | `internal/fingerprint` | Resume las cabeceras y detecta las que faltan en un navegador |
+| Huella | `internal/fingerprint` | Resume las cabeceras y compara el JA4 con herramientas conocidas |
 | Reglas | `internal/rules` | Honeypots, CIDR denegados y rutas con allowlist |
 | Bots | `internal/goodbot` | Comprueba por DNS los user-agent que dicen ser un bot conocido |
 | Puntaje | `internal/scoring` | Convierte las señales en score y decisión |
@@ -100,6 +100,12 @@ Con `proxy_protocol` activo, la IP de la conexión es la que trae la cabecera PR
 Estas cabeceras no entran en la lista de nombres, así que cambiarlas no cambia la huella: `Cookie`, `Content-Length`, `Content-Type`, `Referer`, `Authorization`, `Cache-Control`, `Pragma`, `If-None-Match`, `If-Modified-Since`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded`, `X-Amzn-Trace-Id`, `Origin`, `Sec-Fetch-User` y `Sec-Fetch-Site`.
 
 Si el `User-Agent` contiene `Mozilla/` y falta `Accept`, `Accept-Language` o `Accept-Encoding`, queda marcada la señal de cabeceras incompletas. La comparación busca ese texto tal cual, con la `M` mayúscula.
+
+### JA4
+
+En HTTPS, `tlshello` calcula el JA4 de lo que el cliente ofreció, sin contar GREASE. La forma es `A_B_C`: `A` tiene 10 caracteres (protocolo `t`, versión, `d` si hay SNI o `i` si no, cantidad de ciphers, cantidad de extensiones y ALPN), `B` son 12 hexadecimales del hash de los ciphers ordenados y `C` son 12 hexadecimales del hash de las extensiones ordenadas, sin SNI ni ALPN, más los algoritmos de firma en el orden en que llegaron. `ja4_r` trae esas listas en claro y ordenadas. `ja4_ro` las trae en el orden original.
+
+`JA4Mismatch` marca `ja4_incoherente` cuando el `User-Agent` empieza por `Mozilla/` y el JA4 está en `ja4.tools`. Un `curl` que deja su propio `User-Agent` no entra por aquí: ya lo cubre `ua_herramienta`. En HTTP plano no hay ClientHello, así que no hay señal. Cada entrada necesita `name` y un JA4 con la forma `10_12_12`. Un JA4 repetido hace fallar el arranque. El ejemplo trae el JA4 medido de curl en macOS; cambia con la versión y con la librería TLS.
 
 ### Reglas y bots
 
@@ -152,6 +158,7 @@ Con el YAML de ejemplo los pesos y los umbrales son estos:
 | Cabeceras de navegador incompletas | 30 | `headers_incompletos` | `allow` |
 | Ruta en `rules.honeypots` | 50 | `honeypot` | `challenge` |
 | Límite de tasa superado | 100 | `rate_limit` | `block` |
+| User-Agent de navegador con un JA4 de `ja4.tools` | 60 | `ja4_incoherente` | `challenge` |
 | Ratio de navegador por debajo de `browser_ratio_min` | 15 | `ratio_navegador_bajo` | `allow` |
 
 `ip_denegada` y `ruta_privada` no suman un peso: el score queda en el umbral de `block` y la decisión es `block`, también si el bot estaba verificado. Un bot verificado, sin esas denegaciones, queda en `allow` con score 0 aunque haya visitado un honeypot.
@@ -221,13 +228,13 @@ flowchart TD
 
 Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. En HTTPS suma `tls_version` y `sni`.
+El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. En HTTPS suma `tls_version`, `sni` y `ja4`.
 
 ### HTTPS y ClientHello
 
 El bloque `tls` enciende el listener cuando trae `listen`, `cert_file` o `key_file`. Si aparece uno, los tres son obligatorios. El proceso sale al arrancar si el certificado o la clave no se pueden leer.
 
-Cada conexión HTTPS deja una sola línea `tls_hello`: `sni`, versión y cipher negociados, ALPN, versiones y ciphers ofrecidos, extensiones, curvas y ALPN ofrecido. Un valor GREASE sale como `grease:0x????`. Una extensión sin nombre conocido sale en hexadecimal. Esa línea también se escribe en `/healthz` y `/readyz` del puerto TLS. El puerto HTTP no tiene ClientHello.
+Cada conexión HTTPS deja una sola línea `tls_hello`: `sni`, versión y cipher negociados, ALPN, versiones y ciphers ofrecidos, extensiones, curvas, ALPN ofrecido, `ja4`, `ja4_r` y `ja4_ro`. Un valor GREASE sale como `grease:0x????`. Una extensión sin nombre conocido sale en hexadecimal. Esa línea también se escribe en `/healthz` y `/readyz` del puerto TLS. El puerto HTTP no tiene ClientHello.
 
 ## Qué hay
 
@@ -237,14 +244,14 @@ cmd/upstream/                 binario de prueba
 internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
-internal/fingerprint/         huella de cabeceras
+internal/fingerprint/         huella HTTP y política JA4
 internal/goodbot/             verificación DNS de bots conocidos
 internal/middleware/          cadena, señales, desafío y modo
 internal/policy/              monitor o enforce por prefijo
 internal/ratelimit/           Valkey, memoria y failover
 internal/rules/               honeypots, denegaciones y rutas
 internal/scoring/             pesos, umbrales y decisión
-internal/tlshello/            captura del ClientHello
+internal/tlshello/            ClientHello y cálculo del JA4
 internal/verdict/             IP, huella, señales y decisión
 guardian-config.yml
 ```
@@ -290,6 +297,7 @@ scoring:
     rate_exceeded: 100
     low_browser_ratio: 15
     fake_bot: 90
+    ja4_mismatch: 60
   browser_ratio_min: 0.3
   thresholds:
     challenge: 40
@@ -324,6 +332,10 @@ tls:
   listen: ":8443"
   cert_file: "certs/localhost.pem"
   key_file: "certs/localhost-key.pem"
+ja4:
+  tools:
+    - name: curl-mac
+      ja4: "t13d4907h2_0d8feac7bc37_7395dae3b2f3"
 ```
 
 | Campo | Obligatorio | Por defecto | Descripción |
@@ -361,6 +373,8 @@ tls:
 | `tls.listen` | no | vacío | Dirección HTTPS. Vacío, junto con el certificado y la clave, deja TLS apagado |
 | `tls.cert_file` | no | vacío | Certificado PEM. Obligatorio si el bloque `tls` está activo |
 | `tls.key_file` | no | vacío | Clave privada PEM. Obligatoria si el bloque `tls` está activo |
+| `scoring.weights.ja4_mismatch` | no | 0 | Puntos cuando un `User-Agent` de navegador trae un JA4 de `ja4.tools` |
+| `ja4.tools` | no | vacío | JA4 medidos de herramientas, con `name` y `ja4` |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -373,6 +387,7 @@ La carga también rechaza la configuración cuando:
 - `challenge.difficulty` está fuera del intervalo de 8 a 24.
 - `modes.default` está vacío, no es `monitor` ni `enforce`, o dos rutas quedan con el mismo prefijo.
 - el bloque `tls` está a medias: falta `listen`, `cert_file` o `key_file`.
+- una entrada de `ja4.tools` no tiene `name`, el JA4 no tiene la forma `10_12_12` o el mismo JA4 aparece dos veces.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase.
 
@@ -437,16 +452,17 @@ mkdir -p certs
 openssl req -x509 -newkey rsa:2048 -keyout certs/localhost-key.pem -out certs/localhost.pem -days 365 -nodes -subj "/CN=localhost"
 ```
 
-Una petición HTTPS deja la línea `tls_hello` y, en el log de la petición, `tls_version` y `sni`:
+Una petición a `/healthz` por HTTPS deja la línea `tls_hello` con `ja4`, `ja4_r` y `ja4_ro`. Esa ruta no entra en la cadena, así que no puntúa. La misma petición a `/salud`, con `User-Agent` de navegador y el JA4 `curl-mac` del ejemplo, suma 60 puntos y la decisión es `challenge`:
 
 ```bash
-curl -sk -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" https://localhost:8443/healthz
+curl -sk https://localhost:8443/healthz
+curl -sk -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" https://localhost:8443/salud
 ```
 
 `curl` sin otro `User-Agent` marca `ua_herramienta` y recibe `403` con el cuerpo `acceso denegado`:
 
 ```bash
-curl -s -D - http://localhost:8080/healthz
+curl -s -D - http://localhost:8080/salud
 ```
 
 Un `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Encoding` suma 30 puntos y sigue hacia el upstream. Con esas tres cabeceras el score queda en 0. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y responde `403`. Desde localhost, y sin una cabecera reenviada por un proxy de confianza, la IP limitada es `127.0.0.1`.
