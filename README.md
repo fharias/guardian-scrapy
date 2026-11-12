@@ -4,11 +4,11 @@
 
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go) ![AWS](https://img.shields.io/badge/AWS-ready-FF9900?logo=amazonaws)
 
-Proxy inverso en Go. Resuelve la IP del cliente, calcula una huella de las cabeceras, puntúa cada petición y la reenvía al upstream si el veredicto no llega al umbral de bloqueo. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
+Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición y las convierte en `allow`, `challenge` o `block`. Solo `block` corta la cadena. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
 
 ## Arquitectura
 
-`guardian` escucha en `:8080`. Con `proxy_protocol` activo, el listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. Las rutas de salud salen antes de la cadena de middleware. El resto entra en la cadena y, si el veredicto lo permite, el reverse proxy habla con el upstream. Las métricas de Prometheus van en otro puerto.
+`guardian` escucha en `:8080`. Con `proxy_protocol` activo, el listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. Las rutas de salud salen antes de la cadena de middleware. El resto entra en la cadena y, si la decisión no es `block`, el reverse proxy habla con el upstream. Las métricas de Prometheus van en otro puerto.
 
 ```mermaid
 flowchart LR
@@ -20,6 +20,7 @@ flowchart LR
     pp["Cabecera PROXY si proxy_protocol"]
     salud["GET /healthz y /readyz"]
     cadena[Cadena de middleware]
+    reglas[Reglas y bots]
     reverso["Reverse proxy"]
     failover[FailoverStore]
     memoria[MemoryStore]
@@ -27,12 +28,15 @@ flowchart LR
   end
 
   valkey[("Valkey :6379")]
+  dns[DNS]
   origen["upstream :9000"]
 
   cliente --> listener
   listener --> pp
   pp --> salud
   pp --> cadena
+  cadena --> reglas
+  reglas --> dns
   cadena --> failover
   cadena --> reverso
   failover --> valkey
@@ -41,11 +45,11 @@ flowchart LR
   reverso --> origen
 ```
 
-La cadena se ejecuta en este orden. `Logger` envuelve al resto y escribe el veredicto al volver.
+La cadena se ejecuta en este orden. `Logger` envuelve al resto y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
 
 ```mermaid
 flowchart LR
-  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> honey[Honeypot] --> limite[RateLimit] --> enforce[Enforce] --> origen[Upstream]
+  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
@@ -55,13 +59,16 @@ flowchart LR
 | Configuración | `internal/config` | Carga y validación del YAML |
 | IP del cliente | `internal/clientip` | Elige la IP real a partir del peer y de la cabecera configurada |
 | Huella | `internal/fingerprint` | Resume las cabeceras y detecta las que faltan en un navegador |
-| Middleware | `internal/middleware` | IP, huella, puntuación, honeypots, límite y bloqueo |
-| Veredicto | `internal/verdict` | IP, huella, score, motivos y decisión de la petición |
+| Reglas | `internal/rules` | Honeypots, CIDR denegados y rutas con allowlist |
+| Bots | `internal/goodbot` | Comprueba por DNS los user-agent que dicen ser un bot conocido |
+| Puntaje | `internal/scoring` | Convierte las señales en score y decisión |
+| Middleware | `internal/middleware` | Cadena, señales y corte cuando la decisión es `block` |
+| Veredicto | `internal/verdict` | IP, huella, señales, score y decisión |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
 ### IP del cliente
 
-`ClientIP` guarda la IP en el veredicto. El límite de tasa usa esa IP, el log la incluye y el proxy la escribe en el `X-Forwarded-For` que ve el upstream.
+`ClientIP` guarda la IP en el veredicto. El límite de tasa, las reglas y la verificación de bots usan esa IP. El log la incluye y el proxy la escribe en el `X-Forwarded-For` que ve el upstream.
 
 Si el peer no está en `trusted_proxies`, o si `x_forwarded_for_header` está vacío, la IP es la de la conexión. Un cliente directo no puede falsificar la cabecera. Si el peer es de confianza, la cabecera se recorre de derecha a izquierda y la IP del cliente es la primera que no pertenece a `trusted_proxies`. Un valor que no es una IP corta el recorrido.
 
@@ -84,21 +91,68 @@ Con `proxy_protocol` activo, la IP de la conexión es la que trae la cabecera PR
 
 Estas cabeceras no entran en la lista de nombres, así que cambiarlas no cambia la huella: `Cookie`, `Content-Length`, `Content-Type`, `Referer`, `Authorization`, `Cache-Control`, `Pragma`, `If-None-Match`, `If-Modified-Since`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded` y `X-Amzn-Trace-Id`.
 
-Si el `User-Agent` contiene `Mozilla/` y falta `Accept`, `Accept-Language` o `Accept-Encoding`, la petición suma 30 puntos con el motivo `headers_incompletos`. La comparación busca ese texto tal cual, con la `M` mayúscula. Esos 30 puntos no alcanzan el umbral de 85.
+Si el `User-Agent` contiene `Mozilla/` y falta `Accept`, `Accept-Language` o `Accept-Encoding`, queda marcada la señal de cabeceras incompletas. La comparación busca ese texto tal cual, con la `M` mayúscula.
+
+### Reglas y bots
+
+`Rules` marca el honeypot cuando la ruta está en `rules.honeypots`. La comparación es exacta. También puede dejar un motivo de denegación:
+
+- `ip_denegada`, si la IP está en `rules.deny_cidrs`.
+- `ruta_privada`, si la ruta empieza por el `prefix` de una entrada de `rules.routes` y la IP no está en su `allow_cidrs`.
+
+```mermaid
+flowchart TD
+  ip[IP y ruta] --> denycidr{IP en deny_cidrs}
+  denycidr -->|si| ipden[ip_denegada]
+  denycidr -->|no| route{Hay un prefix que cubre la ruta}
+  route -->|la IP no esta en allow_cidrs| priv[ruta_privada]
+  route -->|la IP esta permitida o no hay prefix| honey{Ruta en honeypots}
+  honey -->|si| trap[senal honeypot]
+```
+
+Si el `User-Agent` contiene el `ua_contains` de un bot de `good_bots`, el proxy hace una comprobación DNS con un tope de 300 ms. El resultado de una consulta terminada se guarda una hora por IP y nombre de bot.
+
+1. DNS inverso de la IP del cliente.
+2. El nombre tiene que ser uno de `domains` o un subdominio suyo.
+3. El DNS directo de ese nombre tiene que devolver la misma IP.
+
+Si las tres cosas cierran, la señal es bot verificado. Si el user-agent reclama el bot y la comprobación no cierra, o si el DNS falla, la señal es bot falso.
+
+### Puntaje
+
+`Score` lee las señales y escribe score, motivos y decisión.
+
+```mermaid
+flowchart TD
+  sig[Senales] --> deny{Hay ip_denegada o ruta_privada}
+  deny -->|si| block["block, score igual al umbral"]
+  deny -->|no| verified{Bot verificado}
+  verified -->|si| allow["allow, score 0, bot_verificado"]
+  verified -->|no| suma[Sumar los pesos activos]
+  suma --> umbral{Score}
+  umbral -->|llega a block| block2[block]
+  umbral -->|llega a challenge| challenge[challenge]
+  umbral -->|por debajo| allow2[allow]
+```
+
+Con el YAML de ejemplo los pesos y los umbrales son estos:
+
+| Señal | Peso | Motivo | Decisión si actúa sola |
+| --- | --- | --- | --- |
+| User-Agent vacío o que contiene `curl` | 90 | `ua_herramienta` | `block` |
+| Bot reclamado y no verificado | 90 | `bot_falso` | `block` |
+| Cabeceras de navegador incompletas | 30 | `headers_incompletos` | `allow` |
+| Ruta en `rules.honeypots` | 50 | `honeypot` | `challenge` |
+| Límite de tasa superado | 100 | `rate_limit` | `block` |
+| Ratio de navegador por debajo de `browser_ratio_min` | 15 | `ratio_navegador_bajo` | `allow` |
+
+`ip_denegada` y `ruta_privada` no suman un peso: el score queda en el umbral de `block` y la decisión es `block`, también si el bot estaba verificado. Un bot verificado, sin esas denegaciones, queda en `allow` con score 0 aunque haya visitado un honeypot.
+
+`Enforce` responde `403` con el cuerpo `forbidden` cuando la decisión es `block`. `allow` y `challenge` siguen hacia el upstream. `challenge` solo queda en el log.
+
+La cadena no asigna la señal de ratio de navegador. El peso `low_browser_ratio` se aplica cuando esa señal viene informada y está por debajo de `browser_ratio_min`.
 
 ## Flujo de una petición
-
-`Init` deja el veredicto en `allow` con score 0. Cada señal suma puntos. `Enforce` corta la cadena cuando el score llega a 85 y responde `403` con el cuerpo `acceso denegado`.
-
-| Señal | Puntos | Motivo |
-| --- | --- | --- |
-| `User-Agent` vacío | 90 | `ua_vacio` |
-| `User-Agent` que contiene `curl` | 90 | `ua_herramienta` |
-| `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` o `Accept-Encoding` | 30 | `headers_incompletos` |
-| Ruta listada en `honeypot_paths` | 50 | `honeypot` |
-| Límite de tasa superado | 100 | `rate_limit` |
-
-Un honeypot o unas cabeceras incompletas no bloquean por sí solos: 50 y 30 están por debajo de 85. El `User-Agent` de `curl` y un límite superado sí bloquean por sí solos.
 
 ```mermaid
 flowchart TD
@@ -109,20 +163,14 @@ flowchart TD
 
   ruta -->|otra| init["Init: score 0, allow"]
   init --> ipres[Resolver la IP del cliente]
-  ipres --> ua{User-Agent}
-  ua -->|vacio| p90a["+90 ua_vacio"]
-  ua -->|contiene curl| p90b["+90 ua_herramienta"]
-  ua -->|otro| fp
-  p90a --> fp
-  p90b --> fp
-
-  fp{"Mozilla/ sin Accept, Accept-Language o Accept-Encoding"} -->|si| p30["+30 headers_incompletos"]
-  fp -->|no| honey
-  p30 --> honey
-
-  honey{Ruta honeypot} -->|si| p50["+50 honeypot"]
-  honey -->|no| limite
-  p50 --> limite[Rate limit por esa IP]
+  ipres --> ua{User-Agent vacio o contiene curl}
+  ua -->|si| tool[senal ua_tool]
+  ua -->|no| fp
+  tool --> fp{Mozilla/ sin Accept, Accept-Language o Accept-Encoding}
+  fp -->|si| incompletas[senal headers_incomplete]
+  fp -->|no| rules
+  incompletas --> rules[Reglas y verificacion DNS del bot]
+  rules --> limite[Rate limit por esa IP]
 
   limite --> circuito{Circuito abierto}
   circuito -->|si| local[MemoryStore]
@@ -130,15 +178,16 @@ flowchart TD
   valkey -->|responde| cupo{Hay token}
   valkey -->|error o timeout| local
   cupo -->|si| restante[Cabecera X-RateLimit-Remaining]
-  cupo -->|no| p100["+100 rate_limit"]
+  cupo -->|no| p100[senal rate_exceeded]
   local --> cupoLocal{Hay token local}
   cupoLocal -->|si| restante
   cupoLocal -->|no| p100
 
-  restante --> umbral
-  p100 --> umbral{Score de al menos 85}
-  umbral -->|si| r403["403 acceso denegado"]
-  umbral -->|no| origen["Reenvio al upstream con esa IP en X-Forwarded-For"]
+  restante --> score[Score]
+  p100 --> score
+  score --> decision{Decision}
+  decision -->|block| r403["403 forbidden"]
+  decision -->|allow o challenge| origen["Reenvio al upstream con esa IP en X-Forwarded-For"]
   origen -->|el upstream falla| r502["502 upstream no disponible"]
   r403 --> registro[Logger escribe el veredicto]
   origen --> registro
@@ -157,9 +206,12 @@ cmd/upstream/                 binario de prueba
 internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
 internal/fingerprint/         huella de cabeceras
-internal/middleware/          cadena, señales y bloqueo
+internal/goodbot/             verificación DNS de bots conocidos
+internal/middleware/          cadena, señales y corte
 internal/ratelimit/           Valkey, memoria y failover
-internal/verdict/             IP, huella, score y decisión
+internal/rules/               honeypots, denegaciones y rutas
+internal/scoring/             pesos, umbrales y decisión
+internal/verdict/             IP, huella, señales y decisión
 guardian-config.yml
 ```
 
@@ -196,6 +248,31 @@ trusted_proxies:
   - "127.0.0.0/8"
 x_forwarded_for_header: "X-Forwarded-For"
 proxy_protocol: false
+scoring:
+  weights:
+    ua_tool: 90
+    headers_incomplete: 30
+    honeypot: 50
+    rate_exceeded: 100
+    low_browser_ratio: 15
+    fake_bot: 90
+  browser_ratio_min: 0.3
+  thresholds:
+    challenge: 40
+    block: 85
+rules:
+  honeypots: ["/admin-oculto", "/wp-login.php", "/.env"]
+  deny_cidrs: ["198.51.100.0/24"]
+  routes:
+    - prefix: /interno
+      allow_cidrs: ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
+good_bots:
+  - name: googlebot
+    ua_contains: Googlebot
+    domains: ["googlebot.com", "google.com"]
+  - name: bingbot
+    ua_contains: bingbot
+    domains: ["search.msn.com"]
 ```
 
 | Campo | Obligatorio | Por defecto | Descripción |
@@ -209,7 +286,7 @@ proxy_protocol: false
 | `shutdown_timeout` | no | `10s` | Tiempo máximo del apagado para terminar las peticiones en curso |
 | `drain_delay` | no | `10s` | Espera tras dejar de estar listo y antes de cerrar el servidor |
 | `preserve_host` | no | `false` | Si es `true`, el `Host` que ve el upstream es el del cliente |
-| `honeypot_paths` | no | vacío | Rutas que suman 50 puntos |
+| `honeypot_paths` | no | vacío | El YAML lo acepta. Las trampas que puntúan son `rules.honeypots` |
 | `app` | no | `shop` | Prefijo de las claves del bucket en Valkey |
 | `redis_addr` | no | `localhost:6379` | Dirección de Valkey |
 | `rate` | no | `1` | Tokens por segundo. Tiene que ser mayor que 0 |
@@ -217,13 +294,23 @@ proxy_protocol: false
 | `trusted_proxies` | no | vacío | CIDR que pueden informar la IP del cliente |
 | `x_forwarded_for_header` | no | vacío | Cabecera que se recorre cuando el peer es de confianza |
 | `proxy_protocol` | no | `false` | Exige la cabecera PROXY a `trusted_proxies` y rechaza el resto |
+| `scoring.weights` | no | 0 | Puntos de cada señal. Un peso 0 no suma |
+| `scoring.browser_ratio_min` | no | 0 | Umbral del ratio de navegador, entre 0 y 1 |
+| `scoring.thresholds.challenge` | sí | — | A partir de este score la decisión es `challenge`. Tiene que ser mayor que 0 y menor que `block` |
+| `scoring.thresholds.block` | sí | — | A partir de este score la decisión es `block` |
+| `rules.honeypots` | no | vacío | Rutas exactas que marcan la señal honeypot |
+| `rules.deny_cidrs` | no | vacío | CIDR que producen `ip_denegada` |
+| `rules.routes` | no | vacío | Prefijos que exigen que la IP esté en `allow_cidrs` |
+| `good_bots` | no | vacío | Bots cuyo user-agent se comprueba por DNS |
 
-Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies` tiene que ser un CIDR válido.
+Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` tiene que empezar por `/`.
 
 La carga también rechaza la configuración cuando:
 
 - `shutdown_timeout` + `drain_delay` es mayor o igual a 30 segundos.
 - `write_timeout` es mayor que `shutdown_timeout`.
+- `scoring.thresholds.challenge` o `block` no son mayores que 0, o `challenge` no es menor que `block`.
+- `scoring.browser_ratio_min` está fuera del intervalo de 0 a 1.
 
 La variable de entorno `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo.
 
@@ -275,17 +362,19 @@ go run ./cmd/guardian
 
 El `guardian-config.yml` del repositorio deja `proxy_protocol` en `false`, así que estas pruebas aceptan un `curl` directo. Si se activa, el listener exige la cabecera PROXY a `127.0.0.0/8` y rechaza esa misma conexión.
 
-`curl` sin otro `User-Agent` suma 90 puntos y recibe `403`:
+`curl` sin otro `User-Agent` marca `ua_herramienta` y recibe `403` con el cuerpo `forbidden`:
 
 ```bash
 curl -s -D - http://localhost:8080/salud
 ```
 
-Con un `User-Agent` que contiene `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Encoding`, la petición suma 30 puntos y sigue hacia el upstream. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y responde `403`. Desde localhost, y sin una cabecera reenviada por un proxy de confianza, la IP limitada es `127.0.0.1`.
+Un `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Encoding` suma 30 puntos y sigue hacia el upstream. Con esas tres cabeceras el score queda en 0. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y responde `403`. Desde localhost, y sin una cabecera reenviada por un proxy de confianza, la IP limitada es `127.0.0.1`.
+
+`/admin-oculto` suma 50 puntos. La decisión es `challenge` y la petición sigue hacia el upstream. `/interno` desde una IP fuera de `10.0.0.0/8`, `127.0.0.1` y `::1` responde `403` por `ruta_privada`.
 
 ```bash
-curl -s -A "Mozilla/5.0" http://localhost:8080/salud
-curl -s -D - -o /dev/null -A "Mozilla/5.0" http://localhost:8080/salud
+curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/salud
+curl -s -D - -o /dev/null -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/admin-oculto
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/healthz
 curl -s http://localhost:2112/metrics
 ```
@@ -295,5 +384,5 @@ La respuesta reenviada incluye la ruta, el `Host`, `X-Forwarded-Host` y `X-Forwa
 `/lento` sirve para ver el efecto de los timeouts: el upstream espera 10 segundos antes de escribir la respuesta.
 
 ```bash
-curl -s -A "Mozilla/5.0" http://localhost:8080/lento
+curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/lento
 ```
