@@ -58,6 +58,7 @@ func Logger(log *slog.Logger) Middleware {
 
 // Calcula el fingerprint de la solicitud y lo agrega al score
 func Fingerprint() Middleware {
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if v := verdict.From(r.Context()); v != nil {
@@ -86,19 +87,6 @@ func SuspiciousUA() Middleware {
 
 func isToolUA(ua string) bool {
 	return ua == "" || strings.Contains(ua, "curl")
-}
-
-// Bloquea la solicitud si el score es mayor o igual a blockAt
-func Enforce() Middleware {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if v := verdict.From(r.Context()); v != nil && v.Decision == verdict.Block {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
 }
 
 // Bloqua honeypots (rutas que no existen)

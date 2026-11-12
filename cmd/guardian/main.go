@@ -19,6 +19,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/fharias/guardian-scrapy/internal/challenge"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
@@ -113,8 +114,14 @@ func main() {
 		os.Exit(1)
 	}
 	bots := goodbot.NewVerifier(cfg.GoodBots, net.DefaultResolver, time.Hour)
+	keys, err := challenge.ParseKeyring(os.Getenv("GUARDIAN_PASS_KEYS"))
+	if err != nil {
+		logger.Error("pass keys", "err", err)
+		os.Exit(1)
+	}
+	ch := challenge.NewService(keys, cfg.Challenge.Difficulty, cfg.Challenge.TTL, cfg.Challenge.PassTTL)
 
-	handler := middleware.Chain(proxy,
+	protected := middleware.Chain(proxy,
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
@@ -123,13 +130,21 @@ func main() {
 		middleware.Rules(engine, bots, 300*time.Millisecond),
 		middleware.RateLimit(store, logger),
 		middleware.Score(scorer),
-		middleware.Enforce(),
+		middleware.Enforce(ch, logger),
 	)
-	mux.Handle("/", handler)
+	verify := middleware.Chain(middleware.VerifyHandler(ch, logger),
+		middleware.Init,
+		middleware.ClientIP(clientipResolver),
+		middleware.Logger(logger),
+		middleware.Fingerprint(),
+	)
+	root := http.NewServeMux()
+	root.Handle(middleware.VerifyPath, verify)
+	root.Handle("/", protected)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           mux,
+		Handler:           root,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

@@ -23,6 +23,8 @@ var volatile = map[string]bool{
 	"pragma": true, "if-none-match": true, "if-modified-since": true,
 	"x-forwarded-for": true, "x-forwarded-proto": true, "x-forwarded-host": true,
 	"forwarded": true, "x-amzn-trace-id": true,
+	"origin":         true,
+	"sec-fetch-user": true, "sec-fetch-site": true,
 }
 
 type Result struct {

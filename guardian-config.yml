@@ -46,3 +46,7 @@ good_bots:
   - name: bingbot
     ua_contains: bingbot
     domains: ["search.msn.com"]
+challenge:
+  difficulty: 16
+  ttl: 2m
+  pass_ttl: 1h

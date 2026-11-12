@@ -15,6 +15,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type ChallengeConfig struct {
+	Difficulty int           `yaml:"difficulty"`
+	TTL        time.Duration `yaml:"ttl"`
+	PassTTL    time.Duration `yaml:"pass_ttl"`
+}
+
 type Config struct {
 	Listen            string        `yaml:"listen"`
 	Upstream          string        `yaml:"upstream"`
@@ -27,17 +33,18 @@ type Config struct {
 	PreserveHost      bool          `yaml:"preserve_host"`
 	HoneypotPaths     []string      `yaml:"honeypot_paths"`
 
-	App                 string         `yaml:"app"`
-	RedisAddr           string         `yaml:"redis_addr"`
-	Rate                float64        `yaml:"rate"`
-	Burst               int            `yaml:"burst"`
-	TrustedProxies      []string       `yaml:"trusted_proxies"`
-	XForwardedForHeader string         `yaml:"x_forwarded_for_header"`
-	ProxyProtocol       bool           `yaml:"proxy_protocol"`
-	Scoring             scoring.Config `yaml:"scoring"`
-	Rules               rules.Config   `yaml:"rules"`
-	GoodBots            []goodbot.Bot  `yaml:"good_bots"`
-	UpstreamURL         *url.URL       `yaml:"-"`
+	App                 string          `yaml:"app"`
+	RedisAddr           string          `yaml:"redis_addr"`
+	Rate                float64         `yaml:"rate"`
+	Burst               int             `yaml:"burst"`
+	TrustedProxies      []string        `yaml:"trusted_proxies"`
+	XForwardedForHeader string          `yaml:"x_forwarded_for_header"`
+	ProxyProtocol       bool            `yaml:"proxy_protocol"`
+	Scoring             scoring.Config  `yaml:"scoring"`
+	Rules               rules.Config    `yaml:"rules"`
+	GoodBots            []goodbot.Bot   `yaml:"good_bots"`
+	Challenge           ChallengeConfig `yaml:"challenge"`
+	UpstreamURL         *url.URL        `yaml:"-"`
 }
 
 func Load(path string) (*Config, error) {
@@ -115,5 +122,9 @@ func (c *Config) validate() error {
 		}
 	}
 
+	// valida en `validate` que `difficulty` esté entre 8 y 24.
+	if c.Challenge.Difficulty < 8 || c.Challenge.Difficulty > 24 {
+		errs = append(errs, errors.New("difficulty debe estar entre 8 y 24"))
+	}
 	return errors.Join(errs...)
 }
