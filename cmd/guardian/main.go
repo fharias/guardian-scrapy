@@ -200,18 +200,6 @@ func main() {
 		logger.Error("no pude escuchar", "err", err)
 		os.Exit(1)
 	}
-	if cfg.ProxyProtocol {
-		policy, err := proxyproto.TrustProxyHeaderFromRanges(cfg.TrustedProxies)
-		if err != nil {
-			logger.Error("proxy protocol", "err", err)
-			os.Exit(1)
-		}
-		ln = &proxyproto.Listener{
-			Listener:          ln,
-			ConnPolicy:        policy,
-			ReadHeaderTimeout: 2 * time.Second,
-		}
-	}
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("servidor", "err", err)
