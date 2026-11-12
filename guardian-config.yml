@@ -29,6 +29,7 @@ scoring:
     rate_exceeded: 100
     low_browser_ratio: 15
     fake_bot: 90
+    ja4_mismatch: 60
   browser_ratio_min: 0.3
   thresholds:
     challenge: 40
@@ -63,3 +64,7 @@ tls:
   listen: ":8443"
   cert_file: "certs/localhost.pem"
   key_file: "certs/localhost-key.pem"
+ja4:
+  tools: 
+    - name: curl-mac
+      ja4: "t13d4907h2_0d8feac7bc37_7395dae3b2f3"

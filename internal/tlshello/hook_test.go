@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,6 +202,58 @@ func TestGetConfigForClientChains(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("no se encadenó el GetConfigForClient previo")
+	}
+}
+
+func TestJA4OverRealTLS(t *testing.T) {
+	var got []string
+	var mu sync.Mutex
+	srv, baseURL, logs := startTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h := FromRequest(r); h != nil {
+			mu.Lock()
+			got = append(got, h.JA4)
+			mu.Unlock()
+		}
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	// Dos conexiones distintas (clientes distintos) con la misma configuración.
+	for i := 0; i < 2; i++ {
+		client := tlsClient(t, srv.certificate, tls.VersionTLS12, tls.VersionTLS13, []string{"h2", "http/1.1"}, false)
+		resp, err := client.Get(baseURL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	// Un cliente solo TLS 1.2 con http/1.1 debe dar otro JA4.
+	old := tlsClient(t, srv.certificate, tls.VersionTLS12, tls.VersionTLS12, []string{"http/1.1"}, true)
+	resp, err := old.Get(baseURL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("esperaba 3 JA4, got %v", got)
+	}
+	if got[0] != got[1] {
+		t.Errorf("mismo cliente, distinto JA4: %s vs %s", got[0], got[1])
+	}
+	if got[0] == got[2] {
+		t.Errorf("clientes distintos, mismo JA4: %s", got[0])
+	}
+	if !strings.HasPrefix(got[0], "t13d") || !strings.Contains(got[0], "h2_") {
+		t.Errorf("ja4 inesperado para TLS 1.3/h2 con SNI: %s", got[0])
+	}
+	if !strings.HasPrefix(got[2], "t12d") || !strings.Contains(got[2], "h1_") {
+		t.Errorf("ja4 inesperado para TLS 1.2/http1.1 con SNI: %s", got[2])
+	}
+	if !strings.Contains(string(logs.Bytes()), `"ja4":"`+got[0]+`"`) {
+		t.Errorf("el log tls_hello no trae el ja4 %s: %s", got[0], logs.Bytes())
 	}
 }
 

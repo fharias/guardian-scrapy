@@ -14,7 +14,8 @@ func testConfig() Config {
 		Weights: Weights{
 			UATool: 90, HeadersIncomplete: 30, Honeypot: 50,
 			RateExceeded: 100, LowBrowserRatio: 15,
-			FakeBot: 90,
+			FakeBot:     90,
+			JA4Mismatch: 60,
 		},
 		Thresholds:      Thresholds{Challenge: 40, Block: 85},
 		BrowserRatioMin: 0.3,
@@ -42,6 +43,8 @@ func TestEvaluate(t *testing.T) {
 		{"ratio alto no suma", verdict.Signals{BrowserRatio: ptr(0.8)}, 0, nil, verdict.Allow},
 		{"honeypot solo desafía", verdict.Signals{Honeypot: true}, 50, []string{"honeypot"}, verdict.Challenge},
 		{"curl bloquea", verdict.Signals{UATool: true}, 90, []string{"ua_herramienta"}, verdict.Block},
+		{"UA de navegador con JA4 de herramienta desafía", verdict.Signals{JA4Mismatch: true}, 60, []string{"ja4_incoherente"}, verdict.Challenge},
+		{"JA4 incoherente + headers incompletos bloquean", verdict.Signals{JA4Mismatch: true, HeadersIncomplete: true}, 90, []string{"headers_incompletos", "ja4_incoherente"}, verdict.Block},
 		{"señales débiles sumadas bloquean", verdict.Signals{
 			HeadersIncomplete: true, Honeypot: true, BrowserRatio: ptr(0.1),
 		}, 95, []string{"headers_incompletos", "honeypot", "ratio_navegador_bajo"}, verdict.Block},

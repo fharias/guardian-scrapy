@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
+	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/rules"
@@ -34,20 +35,21 @@ type Config struct {
 	PreserveHost      bool          `yaml:"preserve_host"`
 	HoneypotPaths     []string      `yaml:"honeypot_paths"`
 
-	App                 string          `yaml:"app"`
-	RedisAddr           string          `yaml:"redis_addr"`
-	Rate                float64         `yaml:"rate"`
-	Burst               int             `yaml:"burst"`
-	TrustedProxies      []string        `yaml:"trusted_proxies"`
-	XForwardedForHeader string          `yaml:"x_forwarded_for_header"`
-	ProxyProtocol       bool            `yaml:"proxy_protocol"`
-	Scoring             scoring.Config  `yaml:"scoring"`
-	Rules               rules.Config    `yaml:"rules"`
-	GoodBots            []goodbot.Bot   `yaml:"good_bots"`
-	Challenge           ChallengeConfig `yaml:"challenge"`
-	Modes               policy.Config   `yaml:"modes"`
-	TLS                 TLSConfig       `yaml:"tls"`
-	UpstreamURL         *url.URL        `yaml:"-"`
+	App                 string                `yaml:"app"`
+	RedisAddr           string                `yaml:"redis_addr"`
+	Rate                float64               `yaml:"rate"`
+	Burst               int                   `yaml:"burst"`
+	TrustedProxies      []string              `yaml:"trusted_proxies"`
+	XForwardedForHeader string                `yaml:"x_forwarded_for_header"`
+	ProxyProtocol       bool                  `yaml:"proxy_protocol"`
+	Scoring             scoring.Config        `yaml:"scoring"`
+	Rules               rules.Config          `yaml:"rules"`
+	GoodBots            []goodbot.Bot         `yaml:"good_bots"`
+	Challenge           ChallengeConfig       `yaml:"challenge"`
+	Modes               policy.Config         `yaml:"modes"`
+	TLS                 TLSConfig             `yaml:"tls"`
+	JA4                 fingerprint.JA4Config `yaml:"ja4"`
+	UpstreamURL         *url.URL              `yaml:"-"`
 }
 
 type TLSConfig struct {
@@ -160,6 +162,9 @@ func (c *Config) validate() error {
 		errs = append(errs, err)
 	}
 	if err := c.TLS.validate(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := fingerprint.NewJA4Policy(c.JA4); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

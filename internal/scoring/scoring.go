@@ -14,6 +14,7 @@ type Weights struct {
 	RateExceeded      int `yaml:"rate_exceeded"`
 	LowBrowserRatio   int `yaml:"low_browser_ratio"`
 	FakeBot           int `yaml:"fake_bot"`
+	JA4Mismatch       int `yaml:"ja4_mismatch"`
 }
 
 type Thresholds struct {
@@ -76,6 +77,7 @@ func (s *Scorer) Evaluate(sig verdict.Signals) (int, []string, verdict.Decision)
 	add(sig.RateExceeded, w.RateExceeded, "rate_limit")
 	add(sig.BrowserRatio != nil && *sig.BrowserRatio < s.cfg.BrowserRatioMin,
 		w.LowBrowserRatio, "ratio_navegador_bajo")
+	add(sig.JA4Mismatch, w.JA4Mismatch, "ja4_incoherente")
 	return score, reasons, s.decide(score)
 }
 

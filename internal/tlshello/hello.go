@@ -20,13 +20,17 @@ type Hello struct {
 	Version     uint16
 	CipherSuite uint16
 	Protocol    string
+	// Se calculan UNA vez, al capturar el ClientHello (paso 14).
+	JA4            string // t13d1517h2_8daaf6152771_xxxxxxxxxxxx
+	JA4Raw         string // ja4_r: listas en claro, ordenadas
+	JA4RawOriginal string // ja4_ro: listas en claro, en el orden que llegaron
 }
 
 func fromClientHello(info *tls.ClientHelloInfo) *Hello {
 	if info == nil {
 		return nil
 	}
-	return &Hello{
+	h := &Hello{
 		SNI:               info.ServerName,
 		CipherSuites:      append([]uint16(nil), info.CipherSuites...),
 		Extensions:        append([]uint16(nil), info.Extensions...),
@@ -35,6 +39,9 @@ func fromClientHello(info *tls.ClientHelloInfo) *Hello {
 		SupportedProtos:   append([]string(nil), info.SupportedProtos...),
 		SignatureSchemes:  append([]tls.SignatureScheme(nil), info.SignatureSchemes...),
 	}
+	r := ComputeJA4(h)
+	h.JA4, h.JA4Raw, h.JA4RawOriginal = r.String(), r.Raw, r.RawOriginal
+	return h
 }
 
 func (h *Hello) applyState(st *tls.ConnectionState) {

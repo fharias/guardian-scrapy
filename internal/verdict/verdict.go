@@ -34,6 +34,7 @@ type Signals struct {
 	DenyReason        string
 	FakeBot           bool
 	VerifiedBot       bool
+	JA4Mismatch       bool
 }
 
 type Verdict struct {
@@ -45,6 +46,7 @@ type Verdict struct {
 	Fingerprint string
 	Mode        string
 	Shadowed    bool
+	JA4         string
 }
 
 func (v *Verdict) Add(points int, reason string) {

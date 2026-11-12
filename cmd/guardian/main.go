@@ -23,6 +23,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/challenge"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
+	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/policy"
@@ -125,12 +126,18 @@ func main() {
 		logger.Error("modes", "err", err)
 		os.Exit(1)
 	}
+	ja4Policy, err := fingerprint.NewJA4Policy(cfg.JA4)
+	if err != nil {
+		logger.Error("ja4", "err", err)
+		os.Exit(1)
+	}
 	protected := middleware.Chain(proxy,
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(),
 		middleware.Fingerprint(),
+		middleware.JA4Mismatch(ja4Policy),
 		middleware.Rules(engine, bots, 300*time.Millisecond),
 		middleware.RateLimit(store, logger),
 		middleware.Score(scorer),

@@ -122,6 +122,12 @@ func withState(ctx context.Context, st *tls.ConnectionState) *Hello {
 	return &cp
 }
 
+func WithHello(ctx context.Context, h *Hello) context.Context {
+	c := &conn{}
+	c.hello.Store(h)
+	return context.WithValue(ctx, ctxKey{}, c)
+}
+
 // LogOnce escribe UNA línea tls_hello por conexión.
 func LogOnce(ctx context.Context, logger *slog.Logger) {
 	if logger == nil {
@@ -148,6 +154,9 @@ func LogOnce(ctx context.Context, logger *slog.Logger) {
 		"extensions", h.ExtensionNames(),
 		"curves", h.CurveNames(),
 		"offered_alpn", h.SupportedProtos,
+		"ja4", h.JA4,
+		"ja4_r", h.JA4Raw, // ← nuevo
+		"ja4_ro", h.JA4RawOriginal, // ← nuevo
 	)
 }
 

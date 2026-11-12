@@ -55,9 +55,27 @@ func Logger(log *slog.Logger) Middleware {
 				"dur_ms", time.Since(start).Milliseconds(),
 			}
 			if h := tlshello.FromRequest(r); h != nil {
-				attrs = append(attrs, "tls_version", h.VersionName(), "sni", h.SNI)
+				attrs = append(attrs, "tls_version", h.VersionName(), "sni", h.SNI, "ja4", h.JA4)
 			}
 			log.Info("request", attrs...)
+		})
+	}
+}
+
+// JA4Mismatch copia el JA4 de la conexión TLS al veredicto y marca la señal
+// cuando el User-Agent dice "navegador" pero el JA4 es de una herramienta
+// conocida. En HTTP plano (sin ClientHello) no hace nada.
+func JA4Mismatch(policy *fingerprint.JA4Policy) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			v := verdict.From(r.Context())
+			if h := tlshello.FromRequest(r); v != nil && h != nil {
+				v.JA4 = h.JA4
+				if _, bad := policy.Mismatch(r.UserAgent(), h.JA4); bad {
+					v.Signals.JA4Mismatch = true
+				}
+			}
+			next.ServeHTTP(w, r)
 		})
 	}
 }
