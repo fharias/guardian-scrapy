@@ -60,21 +60,18 @@ func main() {
 	var ready atomic.Bool
 	ready.Store(true)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	healthz := func(w http.ResponseWriter, r *http.Request) {
 		if ready.Load() {
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-	})
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+	}
+	readyz := func(w http.ResponseWriter, r *http.Request) {
 		if ready.Load() {
 			w.WriteHeader(http.StatusOK)
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-	})
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	go func() {
 		m := http.NewServeMux()
@@ -140,6 +137,8 @@ func main() {
 	)
 	root := http.NewServeMux()
 	root.Handle(middleware.VerifyPath, verify)
+	root.HandleFunc("GET /healthz", healthz)
+	root.HandleFunc("GET /readyz", readyz)
 	root.Handle("/", protected)
 
 	srv := &http.Server{
