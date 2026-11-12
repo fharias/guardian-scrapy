@@ -14,6 +14,7 @@ func testConfig() Config {
 		Weights: Weights{
 			UATool: 90, HeadersIncomplete: 30, Honeypot: 50,
 			RateExceeded: 100, LowBrowserRatio: 15,
+			FakeBot: 90,
 		},
 		Thresholds:      Thresholds{Challenge: 40, Block: 85},
 		BrowserRatioMin: 0.3,
@@ -32,6 +33,9 @@ func TestEvaluate(t *testing.T) {
 		reasons  []string
 		decision verdict.Decision
 	}{
+		{"lista negra gana a todo", verdict.Signals{DenyReason: "ip_denegada", VerifiedBot: true}, 85, []string{"ip_denegada"}, verdict.Block},
+		{"bot verificado pasa aunque visite honeypot", verdict.Signals{VerifiedBot: true, Honeypot: true}, 0, []string{"bot_verificado"}, verdict.Allow},
+		{"googlebot falso bloquea", verdict.Signals{FakeBot: true}, 90, []string{"bot_falso"}, verdict.Block},
 		{"humano limpio", verdict.Signals{}, 0, nil, verdict.Allow},
 		{"sin dato de ratio no suma", verdict.Signals{BrowserRatio: nil}, 0, nil, verdict.Allow},
 		{"ratio 0.0 sí suma", verdict.Signals{BrowserRatio: ptr(0)}, 15, []string{"ratio_navegador_bajo"}, verdict.Allow},

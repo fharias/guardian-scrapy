@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
+	"github.com/fharias/guardian-scrapy/internal/goodbot"
+	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"gopkg.in/yaml.v3"
 )
@@ -33,6 +35,8 @@ type Config struct {
 	XForwardedForHeader string         `yaml:"x_forwarded_for_header"`
 	ProxyProtocol       bool           `yaml:"proxy_protocol"`
 	Scoring             scoring.Config `yaml:"scoring"`
+	Rules               rules.Config   `yaml:"rules"`
+	GoodBots            []goodbot.Bot  `yaml:"good_bots"`
 	UpstreamURL         *url.URL       `yaml:"-"`
 }
 

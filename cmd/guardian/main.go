@@ -21,8 +21,10 @@ import (
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
+	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 	"github.com/redis/go-redis/v9"
@@ -105,13 +107,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	engine, err := rules.New(cfg.Rules)
+	if err != nil {
+		logger.Error("rules", "err", err)
+		os.Exit(1)
+	}
+	bots := goodbot.NewVerifier(cfg.GoodBots, net.DefaultResolver, time.Hour)
+
 	handler := middleware.Chain(proxy,
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(),
 		middleware.Fingerprint(),
-		middleware.Honeypot(cfg.HoneypotPaths...),
+		middleware.Rules(engine, bots, 300*time.Millisecond),
 		middleware.RateLimit(store, logger),
 		middleware.Score(scorer),
 		middleware.Enforce(),

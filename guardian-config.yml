@@ -23,12 +23,26 @@ x_forwarded_for_header: "X-Forwarded-For"
 proxy_protocol: false
 scoring:
   weights:
-    ua_tool: 0
+    ua_tool: 90
     headers_incomplete: 30
     honeypot: 50
     rate_exceeded: 100
     low_browser_ratio: 15
+    fake_bot: 90
   browser_ratio_min: 0.3
   thresholds:
     challenge: 40
     block: 85
+rules:
+  honeypots: ["/admin-oculto", "/wp-login.php", "/.env"]
+  deny_cidrs: ["198.51.100.0/24"]
+  routes:
+    - prefix: /interno
+      allow_cidrs: ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
+good_bots:
+  - name: googlebot
+    ua_contains: Googlebot
+    domains: ["googlebot.com", "google.com"]
+  - name: bingbot
+    ua_contains: bingbot
+    domains: ["search.msn.com"]

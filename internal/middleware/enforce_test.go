@@ -4,7 +4,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/fharias/guardian-scrapy/internal/goodbot"
+	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 )
 
@@ -32,10 +35,31 @@ func TestEnforceBlocksCurl(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	engine, err := rules.New(rules.Config{
+		Honeypots: []string{"/admin-oculto"},
+		DenyCIDRs: []string{"198.51.100.0/24"},
+		Routes: []rules.Route{
+			{
+				Prefix:     "/interno",
+				AllowCIDRs: []string{"10.0.0.0/8", "127.0.0.1/32", "::1/128"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bots := goodbot.NewVerifier([]goodbot.Bot{
+		{
+			Name:       "googlebot",
+			UAContains: "Googlebot",
+			Domains:    []string{"googlebot.com", "google.com"},
+		},
+	}, nil, time.Hour)
 	h := Chain(final,
 		Init,
 		SuspiciousUA(),
-		Honeypot("/admin-oculto", "/robots.txt", "/favicon.ico"),
+		Rules(engine, bots, 1*time.Second),
 		Score(scorer),
 		Enforce(),
 	)

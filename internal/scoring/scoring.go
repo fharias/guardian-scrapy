@@ -13,6 +13,7 @@ type Weights struct {
 	Honeypot          int `yaml:"honeypot"`
 	RateExceeded      int `yaml:"rate_exceeded"`
 	LowBrowserRatio   int `yaml:"low_browser_ratio"`
+	FakeBot           int `yaml:"fake_bot"`
 }
 
 type Thresholds struct {
@@ -53,6 +54,12 @@ func New(cfg Config) (*Scorer, error) {
 }
 
 func (s *Scorer) Evaluate(sig verdict.Signals) (int, []string, verdict.Decision) {
+	if sig.DenyReason != "" {
+		return s.cfg.Thresholds.Block, []string{sig.DenyReason}, verdict.Block
+	}
+	if sig.VerifiedBot {
+		return 0, []string{"bot_verificado"}, verdict.Allow
+	}
 	w := s.cfg.Weights
 	score := 0
 	var reasons []string
@@ -62,6 +69,7 @@ func (s *Scorer) Evaluate(sig verdict.Signals) (int, []string, verdict.Decision)
 			reasons = append(reasons, reason)
 		}
 	}
+	add(sig.FakeBot, w.FakeBot, "bot_falso")
 	add(sig.UATool, w.UATool, "ua_herramienta")
 	add(sig.HeadersIncomplete, w.HeadersIncomplete, "headers_incompletos")
 	add(sig.Honeypot, w.Honeypot, "honeypot")

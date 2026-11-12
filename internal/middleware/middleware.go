@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -10,7 +11,9 @@ import (
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
+	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
@@ -154,6 +157,29 @@ func Score(s *scoring.Scorer) Middleware {
 			if v := verdict.From(r.Context()); v != nil {
 				v.Score, v.Reasons, v.Decision = s.Evaluate(v.Signals)
 			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func Rules(e *rules.Engine, bots *goodbot.Verifier, dnsTimeout time.Duration) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			v := verdict.From(r.Context())
+			if v == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			v.Signals.DenyReason = e.DenyReason(v.ClientIP, r.URL.Path)
+			v.Signals.Honeypot = e.IsHoneypot(r.URL.Path)
+
+			ctx, cancel := context.WithTimeout(r.Context(), dnsTimeout)
+			claimed, verified := bots.Verify(ctx, r.UserAgent(), v.ClientIP)
+			cancel()
+			v.Signals.VerifiedBot = verified
+			v.Signals.FakeBot = claimed && !verified
+
 			next.ServeHTTP(w, r)
 		})
 	}

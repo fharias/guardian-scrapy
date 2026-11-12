@@ -31,6 +31,9 @@ type Signals struct {
 	Honeypot          bool
 	RateExceeded      bool
 	BrowserRatio      *float64
+	DenyReason        string
+	FakeBot           bool
+	VerifiedBot       bool
 }
 
 type Verdict struct {
