@@ -4,11 +4,11 @@
 
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go) ![AWS](https://img.shields.io/badge/AWS-ready-FF9900?logo=amazonaws)
 
-Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición y las convierte en `allow`, `challenge` o `block`. En modo `enforce`, `block` responde `403` y `challenge` pide una prueba de trabajo. En modo `monitor`, esa misma decisión queda en el log y la petición sigue. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
+Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición y las convierte en `allow`, `challenge` o `block`. En modo `enforce`, `block` responde `403` y `challenge` pide una prueba de trabajo. En modo `monitor`, esa misma decisión queda en el log y la petición sigue. Si el bloque `tls` está presente, también escucha HTTPS y guarda el ClientHello. El límite de tasa vive en Valkey y, si Valkey no responde, pasa a un limitador en memoria.
 
 ## Arquitectura
 
-`guardian` escucha en `:8080`. Con `proxy_protocol` activo, el listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. `GET /healthz`, `GET /readyz` y `POST /__guardian/verify` salen antes de la cadena protegida. El resto entra en esa cadena. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto.
+`guardian` escucha HTTP en `:8080`. Con el bloque `tls` del ejemplo, también escucha HTTPS en `:8443`. Con `proxy_protocol` activo, cada listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. En HTTPS el orden es TCP, cabecera PROXY si aplica, captura del ClientHello y luego TLS 1.2 como mínimo. `GET /healthz`, `GET /readyz` y `POST /__guardian/verify` salen antes de la cadena protegida. El resto entra en esa cadena. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto.
 
 ```mermaid
 flowchart LR
@@ -16,7 +16,8 @@ flowchart LR
 
   subgraph proxy [guardian]
     direction TB
-    listener["Listener :8080"]
+    listener["HTTP :8080"]
+    tls["HTTPS :8443 y ClientHello"]
     pp["Cabecera PROXY si proxy_protocol"]
     salud["GET /healthz y /readyz"]
     verify["POST /__guardian/verify"]
@@ -33,7 +34,9 @@ flowchart LR
   origen["upstream :9000"]
 
   cliente --> listener
+  cliente --> tls
   listener --> pp
+  tls --> pp
   pp --> salud
   pp --> verify
   pp --> cadena
@@ -56,7 +59,8 @@ flowchart LR
 
 | Pieza | Paquete | Qué hace |
 | --- | --- | --- |
-| Proxy y servidores | `cmd/guardian` | YAML, listener, PROXY protocol, métricas, Valkey y apagado |
+| Proxy y servidores | `cmd/guardian` | YAML, HTTP, HTTPS, PROXY protocol, métricas, Valkey y apagado |
+| ClientHello | `internal/tlshello` | Foto del saludo TLS y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
 | Configuración | `internal/config` | Carga y validación del YAML |
 | IP del cliente | `internal/clientip` | Elige la IP real a partir del peer y de la cabecera configurada |
@@ -217,7 +221,13 @@ flowchart TD
 
 Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración.
+El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. En HTTPS suma `tls_version` y `sni`.
+
+### HTTPS y ClientHello
+
+El bloque `tls` enciende el listener cuando trae `listen`, `cert_file` o `key_file`. Si aparece uno, los tres son obligatorios. El proceso sale al arrancar si el certificado o la clave no se pueden leer.
+
+Cada conexión HTTPS deja una sola línea `tls_hello`: `sni`, versión y cipher negociados, ALPN, versiones y ciphers ofrecidos, extensiones, curvas y ALPN ofrecido. Un valor GREASE sale como `grease:0x????`. Una extensión sin nombre conocido sale en hexadecimal. Esa línea también se escribe en `/healthz` y `/readyz` del puerto TLS. El puerto HTTP no tiene ClientHello.
 
 ## Qué hay
 
@@ -234,6 +244,7 @@ internal/policy/              monitor o enforce por prefijo
 internal/ratelimit/           Valkey, memoria y failover
 internal/rules/               honeypots, denegaciones y rutas
 internal/scoring/             pesos, umbrales y decisión
+internal/tlshello/            captura del ClientHello
 internal/verdict/             IP, huella, señales y decisión
 guardian-config.yml
 ```
@@ -309,6 +320,10 @@ modes:
       mode: enforce
     - prefix: /interno
       mode: monitor
+tls:
+  listen: ":8443"
+  cert_file: "certs/localhost.pem"
+  key_file: "certs/localhost-key.pem"
 ```
 
 | Campo | Obligatorio | Por defecto | Descripción |
@@ -343,6 +358,9 @@ modes:
 | `challenge.pass_ttl` | no | `0s` | Vigencia de la cookie `guardian_pass` |
 | `modes.default` | sí | — | `monitor` o `enforce` cuando ningún prefijo coincide |
 | `modes.routes` | no | vacío | Prefijos con su modo. Gana el más largo. No se pueden repetir |
+| `tls.listen` | no | vacío | Dirección HTTPS. Vacío, junto con el certificado y la clave, deja TLS apagado |
+| `tls.cert_file` | no | vacío | Certificado PEM. Obligatorio si el bloque `tls` está activo |
+| `tls.key_file` | no | vacío | Clave privada PEM. Obligatoria si el bloque `tls` está activo |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -354,6 +372,7 @@ La carga también rechaza la configuración cuando:
 - `scoring.browser_ratio_min` está fuera del intervalo de 0 a 1.
 - `challenge.difficulty` está fuera del intervalo de 8 a 24.
 - `modes.default` está vacío, no es `monitor` ni `enforce`, o dos rutas quedan con el mismo prefijo.
+- el bloque `tls` está a medias: falta `listen`, `cert_file` o `key_file`.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase.
 
@@ -370,7 +389,7 @@ sequenceDiagram
   SO->>G: señal
   G->>G: /healthz pasa a 503
   G->>G: espera drain_delay
-  G->>C: Shutdown durante shutdown_timeout
+  G->>C: Shutdown de HTTP y HTTPS durante shutdown_timeout
   alt terminan a tiempo
     G->>G: apagado limpio
   else se agota el plazo
@@ -411,10 +430,23 @@ Antes de arrancar el proxy hace falta el llavero. La primera llave firma; se pue
 export GUARDIAN_PASS_KEYS="k1:$(openssl rand -base64 32 | tr -d '\n')"
 ```
 
+El YAML de ejemplo enciende HTTPS en `:8443`. Sin estos archivos el proceso no arranca:
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -keyout certs/localhost-key.pem -out certs/localhost.pem -days 365 -nodes -subj "/CN=localhost"
+```
+
+Una petición HTTPS deja la línea `tls_hello` y, en el log de la petición, `tls_version` y `sni`:
+
+```bash
+curl -sk -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" https://localhost:8443/healthz
+```
+
 `curl` sin otro `User-Agent` marca `ua_herramienta` y recibe `403` con el cuerpo `acceso denegado`:
 
 ```bash
-curl -s -D - http://localhost:8080/salud
+curl -s -D - http://localhost:8080/healthz
 ```
 
 Un `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Encoding` suma 30 puntos y sigue hacia el upstream. Con esas tres cabeceras el score queda en 0. El YAML de ejemplo permite una ráfaga de 2; la tercera seguida suma `rate_limit` y responde `403`. Desde localhost, y sin una cabecera reenviada por un proxy de confianza, la IP limitada es `127.0.0.1`.
@@ -424,7 +456,7 @@ Un `User-Agent` con `Mozilla/` y sin `Accept`, `Accept-Language` ni `Accept-Enco
 `/api` está en `monitor`, así que un `curl` a `/api/precios` llega al upstream y el log marca `shadow`. `/api/checkout` está en `enforce` y ese mismo `curl` recibe `403`. `/interno` también está en `monitor`, pero una IP fuera de `10.0.0.0/8` y `127.0.0.1` sigue recibiendo `403` por `ruta_privada`.
 
 ```bash
-curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/salud
+curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/healthz
 curl -s -D - -o /dev/null -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/admin-oculto
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/healthz
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/readyz
