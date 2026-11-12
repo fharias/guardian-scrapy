@@ -10,6 +10,7 @@ import (
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
+	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"gopkg.in/yaml.v3"
@@ -44,6 +45,7 @@ type Config struct {
 	Rules               rules.Config    `yaml:"rules"`
 	GoodBots            []goodbot.Bot   `yaml:"good_bots"`
 	Challenge           ChallengeConfig `yaml:"challenge"`
+	Modes               policy.Config   `yaml:"modes"`
 	UpstreamURL         *url.URL        `yaml:"-"`
 }
 
@@ -125,6 +127,10 @@ func (c *Config) validate() error {
 	// valida en `validate` que `difficulty` esté entre 8 y 24.
 	if c.Challenge.Difficulty < 8 || c.Challenge.Difficulty > 24 {
 		errs = append(errs, errors.New("difficulty debe estar entre 8 y 24"))
+	}
+
+	if c.Modes.Default == "" {
+		errs = append(errs, errors.New("default es obligatorio"))
 	}
 	return errors.Join(errs...)
 }

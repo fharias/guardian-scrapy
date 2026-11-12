@@ -50,3 +50,10 @@ challenge:
   difficulty: 16
   ttl: 2m
   pass_ttl: 1h
+modes:
+  default: enforce
+  routes:
+    - prefix: /api
+      mode: monitor          # regla nueva: primero medimos
+    - prefix: /api/checkout
+      mode: enforce          # lo crítico se protege ya
