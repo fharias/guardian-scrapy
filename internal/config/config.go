@@ -46,7 +46,34 @@ type Config struct {
 	GoodBots            []goodbot.Bot   `yaml:"good_bots"`
 	Challenge           ChallengeConfig `yaml:"challenge"`
 	Modes               policy.Config   `yaml:"modes"`
+	TLS                 TLSConfig       `yaml:"tls"`
 	UpstreamURL         *url.URL        `yaml:"-"`
+}
+
+type TLSConfig struct {
+	Listen   string `yaml:"listen"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
+func (t TLSConfig) Enabled() bool {
+	return t.Listen != "" || t.CertFile != "" || t.KeyFile != ""
+}
+func (t TLSConfig) validate() error {
+	if !t.Enabled() {
+		return nil
+	}
+	var errs []error
+	if t.Listen == "" {
+		errs = append(errs, errors.New("tls.listen es obligatorio si habilitas TLS"))
+	}
+	if t.CertFile == "" {
+		errs = append(errs, errors.New("tls.cert_file es obligatorio si habilitas TLS"))
+	}
+	if t.KeyFile == "" {
+		errs = append(errs, errors.New("tls.key_file es obligatorio si habilitas TLS"))
+	}
+	return errors.Join(errs...)
 }
 
 func Load(path string) (*Config, error) {
@@ -130,6 +157,9 @@ func (c *Config) validate() error {
 	}
 
 	if _, err := policy.New(c.Modes); err != nil {
+		errs = append(errs, err)
+	}
+	if err := c.TLS.validate(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

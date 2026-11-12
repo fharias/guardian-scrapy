@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"log"
@@ -28,6 +29,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
+	"github.com/fharias/guardian-scrapy/internal/tlshello"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 	"github.com/redis/go-redis/v9"
 )
@@ -146,20 +148,54 @@ func main() {
 	root.HandleFunc("GET /readyz", readyz)
 	root.Handle("/", protected)
 
-	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           root,
-		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
-		ReadTimeout:       cfg.ReadTimeout,
-		WriteTimeout:      cfg.WriteTimeout,
-		IdleTimeout:       cfg.IdleTimeout,
+	newServer := func(addr string, handler http.Handler) *http.Server {
+		return &http.Server{
+			Addr:              addr,
+			Handler:           handler,
+			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+			ReadTimeout:       cfg.ReadTimeout,
+			WriteTimeout:      cfg.WriteTimeout,
+			IdleTimeout:       cfg.IdleTimeout,
+		}
+	}
+
+	abrirListener := func(addr string) (net.Listener, error) {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.ProxyProtocol {
+			policy, err := proxyproto.TrustProxyHeaderFromRanges(cfg.TrustedProxies)
+			if err != nil {
+				ln.Close()
+				return nil, err
+			}
+			ln = &proxyproto.Listener{
+				Listener:          ln,
+				ConnPolicy:        policy,
+				ReadHeaderTimeout: 2 * time.Second,
+			}
+		}
+		return ln, nil
+	}
+
+	httpSrv := newServer(cfg.Listen, root)
+
+	var tlsSrv *http.Server
+	if cfg.TLS.Enabled() {
+		if _, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
+			logger.Error("tls: no pude cargar el certificado", "err", err)
+			os.Exit(1)
+		}
+		tlsSrv = newServer(cfg.TLS.Listen, tlshello.LogHandler(logger, root))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	local.StartJanitor(ctx, time.Minute, logger)
 	defer stop()
 	logger.Info("listener", "addr", cfg.Listen, "proxy_protocol", cfg.ProxyProtocol, "trusted", cfg.TrustedProxies)
-	ln, err := net.Listen("tcp", cfg.Listen)
+
+	ln, err := abrirListener(cfg.Listen)
 	if err != nil {
 		logger.Error("no pude escuchar", "err", err)
 		os.Exit(1)
@@ -177,10 +213,25 @@ func main() {
 		}
 	}
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("servidor", "err", err)
 		}
 	}()
+
+	if tlsSrv != nil {
+		tlsLn, err := abrirListener(cfg.TLS.Listen)
+		if err != nil {
+			logger.Error("no pude escuchar TLS", "err", err)
+			os.Exit(1)
+		}
+		tlsLn = tlshello.Hook(tlsSrv, tlsLn)
+		logger.Info("listener_tls", "addr", cfg.TLS.Listen, "cert", cfg.TLS.CertFile)
+		go func() {
+			if err := tlsSrv.ServeTLS(tlsLn, cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("servidor tls", "err", err)
+			}
+		}()
+	}
 
 	<-ctx.Done()
 	log.Println("señal recibida: dejando de estar listo")
@@ -189,9 +240,13 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	log.Println("cerrando: esperando requests en curso")
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("apagado forzado: %v", err)
-		return
+	}
+	if tlsSrv != nil {
+		if err := tlsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("apagado forzado: %v", err)
+		}
 	}
 	log.Println("apagado limpio")
 

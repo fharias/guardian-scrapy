@@ -15,6 +15,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
+	"github.com/fharias/guardian-scrapy/internal/tlshello"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
 
@@ -41,7 +42,7 @@ func Logger(log *slog.Logger) Middleware {
 			if v == nil {
 				v = &verdict.Verdict{}
 			}
-			log.Info("request",
+			attrs := []any{
 				"client_ip", v.ClientIP.String(),
 				"mode", v.Mode,
 				"shadow", v.Shadowed,
@@ -52,7 +53,11 @@ func Logger(log *slog.Logger) Middleware {
 				"decision", v.Decision.String(),
 				"reasons", v.Reasons,
 				"dur_ms", time.Since(start).Milliseconds(),
-			)
+			}
+			if h := tlshello.FromRequest(r); h != nil {
+				attrs = append(attrs, "tls_version", h.VersionName(), "sni", h.SNI)
+			}
+			log.Info("request", attrs...)
 		})
 	}
 }

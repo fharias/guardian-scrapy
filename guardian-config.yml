@@ -59,3 +59,7 @@ modes:
       mode: enforce
     - prefix: /interno
       mode: monitor
+tls:
+  listen: ":8443"
+  cert_file: "certs/localhost.pem"
+  key_file: "certs/localhost-key.pem"
