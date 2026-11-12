@@ -38,7 +38,7 @@ rules:
   deny_cidrs: ["198.51.100.0/24"]
   routes:
     - prefix: /interno
-      allow_cidrs: ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
+      allow_cidrs: ["10.0.0.0/8", "127.0.0.1/32"]
 good_bots:
   - name: googlebot
     ua_contains: Googlebot
@@ -56,4 +56,6 @@ modes:
     - prefix: /api
       mode: monitor          # regla nueva: primero medimos
     - prefix: /api/checkout
-      mode: enforce          # lo crítico se protege ya
+      mode: enforce
+    - prefix: /interno
+      mode: monitor

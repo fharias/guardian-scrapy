@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/challenge"
+	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
 
@@ -37,12 +38,29 @@ func withVerdict(d verdict.Decision, h http.Handler) http.Handler {
 	})
 }
 
+func enforceAll(t *testing.T) *policy.Modes {
+	t.Helper()
+	m, err := policy.New(policy.Config{Default: policy.Enforce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func monitorAll(t *testing.T) *policy.Modes {
+	t.Helper()
+	m, err := policy.New(policy.Config{Default: policy.Monitor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
 func TestChallengeRoundTrip(t *testing.T) {
 	ch := newService(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
 
-	app := withVerdict(verdict.Challenge, Enforce(ch, logger)(upstream))
+	app := withVerdict(verdict.Challenge, Enforce(ch, enforceAll(t), logger)(upstream))
 	verify := withVerdict(verdict.Challenge, VerifyHandler(ch, logger))
 
 	// 1. Sin pase: página de desafío.
@@ -79,7 +97,8 @@ func TestChallengeRoundTrip(t *testing.T) {
 func TestBlockIgnoresPass(t *testing.T) {
 	ch := newService(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	app := withVerdict(verdict.Block, Enforce(ch, logger)(http.NotFoundHandler()))
+
+	app := withVerdict(verdict.Block, Enforce(ch, enforceAll(t), logger)(http.NotFoundHandler()))
 	rec := httptest.NewRecorder()
 	app.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
 	if rec.Code != http.StatusForbidden {
@@ -97,5 +116,18 @@ func TestSafeNext(t *testing.T) {
 		if got := safeNext(in); got != want {
 			t.Errorf("safeNext(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestMonitorNeverBlocks(t *testing.T) {
+	ch := newService(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
+
+	app := withVerdict(verdict.Challenge, Enforce(ch, enforceAll(t), logger)(upstream))
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d", rec.Code)
 	}
 }

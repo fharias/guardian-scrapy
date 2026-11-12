@@ -43,6 +43,8 @@ type Verdict struct {
 	Reasons     []string
 	Decision    Decision
 	Fingerprint string
+	Mode        string
+	Shadowed    bool
 }
 
 func (v *Verdict) Add(points int, reason string) {

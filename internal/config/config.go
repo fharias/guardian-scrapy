@@ -129,8 +129,8 @@ func (c *Config) validate() error {
 		errs = append(errs, errors.New("difficulty debe estar entre 8 y 24"))
 	}
 
-	if c.Modes.Default == "" {
-		errs = append(errs, errors.New("default es obligatorio"))
+	if _, err := policy.New(c.Modes); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

@@ -43,7 +43,8 @@ func Logger(log *slog.Logger) Middleware {
 			}
 			log.Info("request",
 				"client_ip", v.ClientIP.String(),
-
+				"mode", v.Mode,
+				"shadow", v.Shadowed,
 				"fingerprint", v.Fingerprint,
 				"method", r.Method,
 				"path", r.URL.Path,

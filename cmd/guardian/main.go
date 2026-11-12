@@ -24,6 +24,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
+	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
@@ -117,7 +118,11 @@ func main() {
 		os.Exit(1)
 	}
 	ch := challenge.NewService(keys, cfg.Challenge.Difficulty, cfg.Challenge.TTL, cfg.Challenge.PassTTL)
-
+	modes, err := policy.New(cfg.Modes)
+	if err != nil {
+		logger.Error("modes", "err", err)
+		os.Exit(1)
+	}
 	protected := middleware.Chain(proxy,
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
@@ -127,7 +132,7 @@ func main() {
 		middleware.Rules(engine, bots, 300*time.Millisecond),
 		middleware.RateLimit(store, logger),
 		middleware.Score(scorer),
-		middleware.Enforce(ch, logger),
+		middleware.Enforce(ch, modes, logger),
 	)
 	verify := middleware.Chain(middleware.VerifyHandler(ch, logger),
 		middleware.Init,

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/fharias/guardian-scrapy/internal/challenge"
+	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 )
 
@@ -16,12 +17,19 @@ const (
 	VerifyPath = "/__guardian/verify"
 )
 
-func Enforce(ch *challenge.Service, logger *slog.Logger) Middleware {
+func Enforce(ch *challenge.Service, modes *policy.Modes, logger *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			v := verdict.From(r.Context())
 			if v == nil {
 				next.ServeHTTP(w, r)
+				return
+			}
+			mode := modes.For(r.URL.Path)
+			v.Mode = string(mode)
+			if mode == policy.Monitor && v.Decision != verdict.Allow && v.Signals.DenyReason == "" {
+				v.Shadowed = true
+				next.ServeHTTP(w, r) // registra, pero NO bloquea ni desafía
 				return
 			}
 			switch v.Decision {
