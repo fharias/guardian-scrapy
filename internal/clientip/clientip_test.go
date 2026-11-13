@@ -34,3 +34,29 @@ func TestClientIP(t *testing.T) {
 		})
 	}
 }
+
+func TestPeerIsTrusted(t *testing.T) {
+	r, err := New([]string{"10.0.0.0/8", "::1/128"}, "X-Forwarded-For")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, remote string
+		want         bool
+	}{
+		{"dentro de la VPC", "10.0.1.5:5000", true},
+		{"loopback IPv6", "[::1]:5000", true},
+		{"IP pública", "203.0.113.7:5000", false},
+		{"RemoteAddr basura", "no-soy-direccion", false},
+		{"RemoteAddr vacío", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.RemoteAddr = tc.remote
+			if got := r.PeerIsTrusted(req); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

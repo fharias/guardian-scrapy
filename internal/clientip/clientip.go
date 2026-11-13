@@ -33,6 +33,17 @@ func (r *Resolver) isTrusted(ip netip.Addr) bool {
 	return false
 }
 
+// PeerIsTrusted dice si quien abrió la conexión TCP (RemoteAddr, el vecino
+// inmediato) está en la lista de proxies confiables. Otros paquetes lo usan
+// para decidir si creen en un header que ese vecino agregó (paso 15).
+func (r *Resolver) PeerIsTrusted(request *http.Request) bool {
+	ap, err := netip.ParseAddrPort(request.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	return r.isTrusted(ap.Addr().Unmap())
+}
+
 func (r *Resolver) ClientIP(request *http.Request) netip.Addr {
 	ap, err := netip.ParseAddrPort(request.RemoteAddr)
 	if err != nil {

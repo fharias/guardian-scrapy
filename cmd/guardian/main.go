@@ -25,6 +25,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
+	"github.com/fharias/guardian-scrapy/internal/ja4source"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
@@ -131,12 +132,18 @@ func main() {
 		logger.Error("ja4", "err", err)
 		os.Exit(1)
 	}
+	ja4Source, err := ja4source.New(cfg.JA4.Source, clientipResolver.PeerIsTrusted)
+	if err != nil {
+		logger.Error("ja4source", "err", err)
+		os.Exit(1)
+	}
 	protected := middleware.Chain(proxy,
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(),
 		middleware.Fingerprint(),
+		middleware.JA4(ja4Source, logger),
 		middleware.JA4Mismatch(ja4Policy),
 		middleware.Rules(engine, bots, 300*time.Millisecond),
 		middleware.RateLimit(store, logger),
@@ -148,6 +155,7 @@ func main() {
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
 		middleware.Fingerprint(),
+		middleware.JA4(ja4Source, logger),
 	)
 	root := http.NewServeMux()
 	root.Handle(middleware.VerifyPath, verify)
@@ -200,6 +208,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	local.StartJanitor(ctx, time.Minute, logger)
 	defer stop()
+	logger.Info("ja4", "source", cfg.JA4.Source)
 	logger.Info("listener", "addr", cfg.Listen, "proxy_protocol", cfg.ProxyProtocol, "trusted", cfg.TrustedProxies)
 
 	ln, err := abrirListener(cfg.Listen)

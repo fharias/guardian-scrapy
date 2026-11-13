@@ -12,6 +12,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
+	"github.com/fharias/guardian-scrapy/internal/ja4source"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
@@ -55,23 +56,49 @@ func Logger(log *slog.Logger) Middleware {
 				"dur_ms", time.Since(start).Milliseconds(),
 			}
 			if h := tlshello.FromRequest(r); h != nil {
-				attrs = append(attrs, "tls_version", h.VersionName(), "sni", h.SNI, "ja4", h.JA4)
+				attrs = append(attrs, "tls_version", h.VersionName(), "sni", h.SNI)
+			}
+			if v.JA4Source != "" {
+				attrs = append(attrs, "ja4", v.JA4, "ja4_source", v.JA4Source)
 			}
 			log.Info("request", attrs...)
 		})
 	}
 }
 
-// JA4Mismatch copia el JA4 de la conexión TLS al veredicto y marca la señal
-// cuando el User-Agent dice "navegador" pero el JA4 es de una herramienta
-// conocida. En HTTP plano (sin ClientHello) no hace nada.
+// JA4 le pregunta a la Source de dónde sale el JA4 de esta petición y lo deja
+// en el veredicto. Después borra el header de CloudFront: si la petición llegó
+// hasta aquí, el JA4 ya quedó decidido, y el upstream no debe creerle a un
+// header que cualquiera pudo escribir.
+func JA4(src ja4source.Source, log *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			res := src.JA4(r)
+			if res.Rejected != "" {
+				log.Warn("ja4_header_rechazado",
+					"motivo", res.Rejected,
+					"peer", r.RemoteAddr,
+					"path", r.URL.Path,
+					"header", res.Header,
+				)
+			}
+			if v := verdict.From(r.Context()); v != nil {
+				v.JA4, v.JA4Source = res.JA4, res.Source
+			}
+			r.Header.Del(ja4source.CloudFrontHeader)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// JA4Mismatch marca la señal cuando el User-Agent dice "navegador" pero el JA4
+// del veredicto es de una herramienta conocida. No le importa de dónde salió
+// el JA4: eso lo decidió el middleware JA4. Debe ir después de él.
 func JA4Mismatch(policy *fingerprint.JA4Policy) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			v := verdict.From(r.Context())
-			if h := tlshello.FromRequest(r); v != nil && h != nil {
-				v.JA4 = h.JA4
-				if _, bad := policy.Mismatch(r.UserAgent(), h.JA4); bad {
+			if v := verdict.From(r.Context()); v != nil && v.JA4 != "" {
+				if _, bad := policy.Mismatch(r.UserAgent(), v.JA4); bad {
 					v.Signals.JA4Mismatch = true
 				}
 			}

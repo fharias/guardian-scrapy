@@ -59,3 +59,43 @@ func TestNewJA4PolicyRejectsBadConfig(t *testing.T) {
 		})
 	}
 }
+func TestValidJA4(t *testing.T) {
+	cases := []struct {
+		name, in string
+		want     bool
+	}{
+		{"el de Chrome", "t13d1517h2_8daaf6152771_cb7bf5808d99", true},
+		{"c todo ceros (lista vacía)", "t13d1517h2_8daaf6152771_000000000000", true},
+		{"muy corto", "t13d1517h2", false},
+		{"largo de b incorrecto", "t13d1517h2_8daaf615277_cb7bf5808d99", false},
+		{"b con caracteres no hex", "t13d1517h2_8daaf615277z_cb7bf5808d99", false},
+		{"mayúsculas", "T13D1517H2_8DAAF6152771_CB7BF5808D99", false},
+		{"espacio", "t13d1517h2_8daaf6152771_cb7bf580 d99", false},
+		{"vacío", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ValidJA4(c.in); got != c.want {
+				t.Fatalf("ValidJA4(%q) = %v, want %v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestJA4ConfigValidate(t *testing.T) {
+	cases := []struct {
+		source  string
+		wantErr bool
+	}{
+		{"", false}, {"tls", false}, {"cloudfront", false}, {"none", false},
+		{"CloudFront", true}, {"akamai", true},
+	}
+	for _, c := range cases {
+		t.Run(c.source, func(t *testing.T) {
+			err := JA4Config{Source: c.source}.Validate()
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+		})
+	}
+}

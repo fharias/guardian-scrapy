@@ -96,6 +96,7 @@ func Load(path string) (*Config, error) {
 		App:               "shop",
 		Rate:              1,
 		Burst:             10,
+		JA4:               fingerprint.JA4Config{Source: fingerprint.SourceTLS},
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -161,6 +162,11 @@ func (c *Config) validate() error {
 	if _, err := policy.New(c.Modes); err != nil {
 		errs = append(errs, err)
 	}
+
+	if c.JA4.Source == fingerprint.SourceCloudFront && len(c.TrustedProxies) == 0 {
+		errs = append(errs, errors.New("ja4.source: cloudfront requiere trusted_proxies: sin proxies confiables nunca se creería el header"))
+	}
+
 	if err := c.TLS.validate(); err != nil {
 		errs = append(errs, err)
 	}

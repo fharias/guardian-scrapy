@@ -1,0 +1,5 @@
+{"time":"2026-11-12T19:05:30.090595-05:00","level":"INFO","msg":"ja4","source":"cloudfront"}
+{"time":"2026-11-12T19:05:30.090712-05:00","level":"INFO","msg":"listener","addr":":8080","proxy_protocol":false,"trusted":["10.0.0.0/8"]}
+{"time":"2026-11-12T19:05:30.091116-05:00","level":"INFO","msg":"listener_tls","addr":":8443","cert":"certs/localhost.pem"}
+{"time":"2026-11-12T19:05:36.676597-05:00","level":"WARN","msg":"ja4_header_rechazado","motivo":"peer_no_confiable","peer":"127.0.0.1:65124","path":"/api/prices","header":"esto-no-es-un-ja4"}
+{"time":"2026-11-12T19:05:36.683611-05:00","level":"INFO","msg":"request","client_ip":"127.0.0.1","mode":"monitor","shadow":false,"fingerprint":"21f98defef2fa5ff","method":"GET","path":"/api/prices","score":0,"decision":"allow","reasons":null,"dur_ms":7}
