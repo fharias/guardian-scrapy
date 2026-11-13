@@ -18,6 +18,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/tlshello"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Inicializa el middleware de verificación de acceso
@@ -60,6 +61,9 @@ func Logger(log *slog.Logger) Middleware {
 			}
 			if v.JA4Source != "" {
 				attrs = append(attrs, "ja4", v.JA4, "ja4_source", v.JA4Source)
+			}
+			if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
+				attrs = append(attrs, "trace_id", sc.TraceID().String())
 			}
 			log.Info("request", attrs...)
 		})

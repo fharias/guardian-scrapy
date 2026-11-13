@@ -35,9 +35,17 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/tlshello"
+	"github.com/fharias/guardian-scrapy/internal/tracing"
 	"github.com/fharias/guardian-scrapy/internal/verdict"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
 )
+
+// version identifica el build en los traces (service.version en Jaeger).
+// Se puede sobrescribir al compilar:
+//
+//	go build -ldflags "-X main.version=$(git rev-parse --short HEAD)" ./cmd/guardian
+var version = "dev"
 
 func main() {
 	path := flag.String("config", "guardian-config.yml", "ruta del archivo de configuración")
@@ -58,6 +66,7 @@ func main() {
 			if cfg.PreserveHost {
 				pr.Out.Host = pr.In.Host
 			}
+			tracing.InjectUpstream(pr.Out)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("error hacia upstream: %v", err)
@@ -132,10 +141,6 @@ func main() {
 		os.Exit(1)
 	}
 	mets := metrics.New(prometheus.DefaultRegisterer)
-	if err != nil {
-		logger.Error("metrics", "err", err)
-		os.Exit(1)
-	}
 	ja4Policy, err := fingerprint.NewJA4Policy(cfg.JA4)
 	if err != nil {
 		logger.Error("ja4", "err", err)
@@ -146,19 +151,29 @@ func main() {
 		logger.Error("ja4source", "err", err)
 		os.Exit(1)
 	}
+	tracer := otel.Tracer("github.com/fharias/guardian-scrapy")
+	step := func(name string, mw middleware.Middleware) middleware.Middleware {
+		return middleware.Traced(tracer, name, mw)
+	}
 	protected := middleware.Chain(proxy,
 		middleware.Init,
 		mets.Middleware(modes.Route),
-		middleware.ClientIP(clientipResolver),
+		middleware.Trace(tracer, middleware.TraceOptions{
+			Route: modes.Route,
+			TrustIncoming: func(r *http.Request) bool {
+				return cfg.Tracing.TrustIncoming && clientipResolver.PeerIsTrusted(r)
+			},
+		}),
+		step("clientip", middleware.ClientIP(clientipResolver)),
 		middleware.Logger(logger),
-		middleware.SuspiciousUA(),
-		middleware.Fingerprint(),
-		middleware.JA4(ja4Source, logger),
-		middleware.JA4Mismatch(ja4Policy),
-		middleware.Rules(engine, bots, 300*time.Millisecond),
-		middleware.RateLimit(store, logger),
-		middleware.Score(scorer),
-		middleware.Enforce(ch, modes, logger),
+		step("suspiciousua", middleware.SuspiciousUA()),
+		step("fingerprint", middleware.Fingerprint()),
+		step("ja4", middleware.JA4(ja4Source, logger)),
+		step("ja4mismatch", middleware.JA4Mismatch(ja4Policy)),
+		step("rules", middleware.Rules(engine, bots, 300*time.Millisecond)),
+		step("ratelimit", middleware.RateLimit(store, logger)),
+		step("score", middleware.Score(scorer)),
+		step("enforce", middleware.Enforce(ch, modes, logger)),
 	)
 	verify := middleware.Chain(middleware.VerifyHandler(ch, logger),
 		middleware.Init,
@@ -216,6 +231,13 @@ func main() {
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	shutdownTracing, err := tracing.Setup(ctx, cfg.Tracing, version)
+	if err != nil {
+		logger.Error("tracing", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("tracing", "enabled", cfg.Tracing.Enabled, "endpoint", cfg.Tracing.Endpoint,
+		"sample_ratio", cfg.Tracing.SampleRatio, "trust_incoming", cfg.Tracing.TrustIncoming)
 	local.StartJanitor(ctx, time.Minute, logger)
 	defer stop()
 	logger.Info("ja4", "source", cfg.JA4.Source)
@@ -261,6 +283,9 @@ func main() {
 		if err := tlsSrv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("apagado forzado: %v", err)
 		}
+	}
+	if err := shutdownTracing(shutdownCtx); err != nil {
+		log.Printf("tracing: no pude vaciar los spans: %v", err)
 	}
 	log.Println("apagado limpio")
 

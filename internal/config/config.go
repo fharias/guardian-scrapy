@@ -14,6 +14,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
+	"github.com/fharias/guardian-scrapy/internal/tracing"
 	"gopkg.in/yaml.v3"
 )
 
@@ -49,6 +50,7 @@ type Config struct {
 	Modes               policy.Config         `yaml:"modes"`
 	TLS                 TLSConfig             `yaml:"tls"`
 	JA4                 fingerprint.JA4Config `yaml:"ja4"`
+	Tracing             tracing.Config        `yaml:"tracing"`
 	UpstreamURL         *url.URL              `yaml:"-"`
 }
 
@@ -171,6 +173,9 @@ func (c *Config) validate() error {
 		errs = append(errs, err)
 	}
 	if _, err := fingerprint.NewJA4Policy(c.JA4); err != nil {
+		errs = append(errs, err)
+	}
+	if err := c.Tracing.Validate(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

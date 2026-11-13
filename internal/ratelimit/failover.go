@@ -8,6 +8,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var failOpenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -37,9 +39,15 @@ func NewFailoverStore(primary, fallback RateStore, timeout time.Duration,
 	}
 }
 
+func markFailOpen(ctx context.Context, reason string) {
+	trace.SpanFromContext(ctx).AddEvent("fail_open",
+		trace.WithAttributes(attribute.String("reason", reason)))
+}
+
 func (f *FailoverStore) Allow(ctx context.Context, key string) (Result, error) {
 	if time.Now().UnixNano() < f.openUntil.Load() {
 		failOpenTotal.WithLabelValues("circuit_open").Inc()
+		markFailOpen(ctx, "circuit_open")
 		return f.fallback.Allow(ctx, key)
 	}
 
@@ -57,7 +65,7 @@ func (f *FailoverStore) Allow(ctx context.Context, key string) (Result, error) {
 		reason = "timeout"
 	}
 	failOpenTotal.WithLabelValues(reason).Inc()
-
+	markFailOpen(ctx, reason)
 	if f.fails.Add(1) >= f.maxFails {
 		f.openUntil.Store(time.Now().Add(f.cooldown).UnixNano())
 		f.fails.Store(0)

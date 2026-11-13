@@ -69,3 +69,9 @@ ja4:
   tools: 
     - name: curl-mac
       ja4: "t13d4907h2_0d8feac7bc37_7395dae3b2f3"
+tracing:
+  enabled: true
+  endpoint: "localhost:4318"   # Jaeger local, OTLP/HTTP
+  insecure: true               # solo local
+  sample_ratio: 1.0            # en local guardamos todo
+  trust_incoming: false
