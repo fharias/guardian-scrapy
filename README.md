@@ -8,7 +8,7 @@ Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición 
 
 ## Arquitectura
 
-`guardian` escucha HTTP en `:8080`. Con el bloque `tls` del ejemplo, también escucha HTTPS en `:8443`. Con `proxy_protocol` activo, cada listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. En HTTPS el orden es TCP, cabecera PROXY si aplica, captura del ClientHello y luego TLS 1.2 como mínimo. `GET /healthz`, `GET /readyz` y `POST /__guardian/verify` salen antes de la cadena protegida. El resto entra en esa cadena. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto.
+`guardian` escucha HTTP en `:8080`. Con el bloque `tls` del ejemplo, también escucha HTTPS en `:8443`. Con `proxy_protocol` activo, cada listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. En HTTPS el orden es TCP, cabecera PROXY si aplica, captura del ClientHello y luego TLS 1.2 como mínimo. `GET /healthz`, `GET /readyz` y `POST /__guardian/verify` salen antes de la cadena protegida. El resto entra en esa cadena. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto. Con `tracing.enabled`, los spans de la cadena protegida salen por OTLP/HTTP.
 
 ```mermaid
 flowchart LR
@@ -32,6 +32,7 @@ flowchart LR
   valkey[("Valkey :6379")]
   dns[DNS]
   origen["upstream :9000"]
+  colector["Colector OTLP/HTTP :4318"]
 
   cliente --> listener
   cliente --> tls
@@ -47,19 +48,20 @@ flowchart LR
   failover --> valkey
   failover -.-> memoria
   failover -.-> metricas
+  cadena -.-> colector
   reverso --> origen
 ```
 
-La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del resto. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
+La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del resto. `Trace` abre el span raíz y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
 
 ```mermaid
 flowchart LR
-  init[Init] --> mets[Metrics] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+  init[Init] --> mets[Metrics] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
 | --- | --- | --- |
-| Proxy y servidores | `cmd/guardian` | YAML, HTTP, HTTPS, PROXY protocol, métricas, Valkey y apagado |
+| Proxy y servidores | `cmd/guardian` | YAML, HTTP, HTTPS, PROXY protocol, métricas, trazas, Valkey y apagado |
 | ClientHello | `internal/tlshello` | Foto del saludo TLS, JA4 y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
 | Configuración | `internal/config` | Carga y validación del YAML |
@@ -73,6 +75,7 @@ flowchart LR
 | Modos | `internal/policy` | Elige `monitor` o `enforce` según el prefijo más largo y ese prefijo es el label `route` |
 | Middleware | `internal/middleware` | Cadena, señales, página de desafío y corte en `block` |
 | Métricas | `internal/metrics` | Contadores, histograma y gauge de la cadena protegida |
+| Trazas | `internal/tracing` | Exporter OTLP/HTTP, muestreo y `Traceparent` hacia el upstream |
 | Veredicto | `internal/verdict` | IP, huella, señales, score y decisión |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
@@ -249,9 +252,35 @@ flowchart TD
   r502 --> registro
 ```
 
-Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`.
+Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`, y dejan un evento `fail_open` con ese `reason` en el span `mw.ratelimit`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. Si hubo un origen de JA4, suma `ja4` y `ja4_source`. En HTTPS suma también `tls_version` y `sni`.
+El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. Si hubo un origen de JA4, suma `ja4` y `ja4_source`. En HTTPS suma también `tls_version` y `sni`. Si el span de la petición es válido, suma `trace_id`.
+
+### Trazas
+
+`tracing.enabled` en falso deja el exporter apagado. El proceso arranca igual y la validación no exige `endpoint` ni `sample_ratio`. En el YAML de ejemplo está en verdadero y apunta a `localhost:4318`.
+
+Con el bloque activo, guardian crea un `TracerProvider` por lotes y lo envía por OTLP/HTTP a `tracing.endpoint` (`host:puerto`, sin esquema ni ruta). Cada envío tiene un tope de 5 segundos. `insecure` usa HTTP plano. El recurso lleva `service.name` `guardian` y `service.version`: por defecto `dev`, y se puede fijar al compilar con `-ldflags "-X main.version=..."`. El sampler es `ParentBased` sobre `TraceIDRatioBased`. Un `sample_ratio` de 0 no guarda trazas nuevas. Un padre ya muestreado sí se continúa.
+
+`Trace` solo envuelve la cadena protegida. `/healthz`, `/readyz` y `POST /__guardian/verify` no abren span. El nombre del span raíz es el método y el prefijo de `modes.routes` que gana, el mismo label `route` de las métricas: `GET /api`, `GET /api/checkout` o `GET default`. El método admite `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT` y `TRACE`. Cualquier otro queda en `_OTHER`. Al cerrar, el span guarda `http.response.status_code` y, si hay veredicto, `guardian.decision`, `guardian.score`, `guardian.mode`, `guardian.shadow`, `guardian.reasons` y `guardian.ja4_source`. Un status de 500 o más marca el span como error.
+
+Cada paso envuelto cuelga de ese raíz y termina cuando llama al siguiente, así que no se solapan y no incluyen el tiempo del resto de la cadena. `Init`, `Metrics` y `Logger` no tienen span propio. El raíz sigue abierto hasta que la respuesta vuelve, incluido el upstream.
+
+```mermaid
+flowchart TD
+  root["Span raiz: METHOD route"]
+  root --> a[mw.clientip]
+  root --> b[mw.suspiciousua]
+  root --> c[mw.fingerprint]
+  root --> d[mw.ja4]
+  root --> e[mw.ja4mismatch]
+  root --> f[mw.rules]
+  root --> g[mw.ratelimit]
+  root --> h[mw.score]
+  root --> i[mw.enforce]
+```
+
+`trust_incoming` solo lee el `Traceparent` entrante cuando además el peer TCP inmediato está en `trusted_proxies`. Con el ejemplo en `false`, un `Traceparent` de `127.0.0.1` abre una traza nueva. Antes de reenviar, guardian borra `Traceparent`, `Tracestate` y `Baggage` del request saliente y escribe el `Traceparent` del span raíz. El upstream de prueba lo imprime en el cuerpo.
 
 ### HTTPS y ClientHello
 
@@ -271,7 +300,8 @@ internal/fingerprint/         huella HTTP y política JA4
 internal/ja4source/           origen del JA4: tls, cloudfront o none
 internal/goodbot/             verificación DNS de bots conocidos
 internal/metrics/             RED, decisiones y señales de Prometheus
-internal/middleware/          cadena, señales, desafío y modo
+internal/middleware/          cadena, señales, desafío, modo y spans
+internal/tracing/             OTLP/HTTP, muestreo y Traceparent hacia el upstream
 internal/policy/              monitor o enforce por prefijo; label route
 internal/ratelimit/           Valkey, memoria y failover
 internal/rules/               honeypots, denegaciones y rutas
@@ -402,6 +432,11 @@ ja4:
 | `scoring.weights.ja4_mismatch` | no | 0 | Puntos cuando un `User-Agent` de navegador trae un JA4 de `ja4.tools` |
 | `ja4.source` | no | `tls` | `tls`, `cloudfront` o `none` |
 | `ja4.tools` | no | vacío | JA4 medidos de herramientas, con `name` y `ja4` en minúsculas |
+| `tracing.enabled` | no | `false` | Enciende el exporter OTLP/HTTP |
+| `tracing.endpoint` | si `enabled` | vacío | `host:puerto` del colector. En el ejemplo, `localhost:4318` |
+| `tracing.insecure` | no | `false` | HTTP plano hacia el colector |
+| `tracing.sample_ratio` | no | `0` | Fracción de trazas nuevas, de 0 a 1. El ejemplo usa `1` |
+| `tracing.trust_incoming` | no | `false` | Continúa el `Traceparent` de un peer en `trusted_proxies` |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -416,6 +451,7 @@ La carga también rechaza la configuración cuando:
 - el bloque `tls` está a medias: falta `listen`, `cert_file` o `key_file`.
 - `ja4.source` no es `tls`, `cloudfront` ni `none`, o `cloudfront` se usa sin `trusted_proxies`.
 - una entrada de `ja4.tools` no tiene `name`, el JA4 no tiene la forma `10_12_12` en minúsculas o el mismo JA4 aparece dos veces.
+- `tracing.enabled` es verdadero y falta `tracing.endpoint`, o `tracing.sample_ratio` queda fuera de 0 a 1.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase.
 
@@ -433,6 +469,7 @@ sequenceDiagram
   G->>G: /healthz pasa a 503
   G->>G: espera drain_delay
   G->>C: Shutdown de HTTP y HTTPS durante shutdown_timeout
+  G->>G: vacía los spans con el tiempo que quede de ese plazo
   alt terminan a tiempo
     G->>G: apagado limpio
   else se agota el plazo
@@ -463,6 +500,18 @@ Valkey, en segundo plano y publicado en el puerto `6379`:
 
 ```bash
 docker run -d --name valkey -p 6379:6379 valkey/valkey:8
+```
+
+Jaeger, para el `tracing` del ejemplo. La UI queda en `http://localhost:16686` y el OTLP/HTTP en el puerto `4318`. El servicio `guardian` aparece ahí con la versión del build. Si el colector no está, el proceso arranca igual y el envío de cada lote falla al cabo de 5 segundos.
+
+```bash
+docker run -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/jaeger:2.23.0
+```
+
+La versión que viaja en `service.version` se fija al compilar. Sin ese flag queda `dev`.
+
+```bash
+go build -ldflags "-X main.version=$(git rev-parse --short HEAD)" -o guardian ./cmd/guardian
 ```
 
 En una terminal, el upstream de prueba:
@@ -520,7 +569,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/readyz
 curl -s http://localhost:2112/metrics
 ```
 
-La respuesta reenviada incluye la ruta, el `Host`, `X-Forwarded-Host` y `X-Forwarded-Proto`. `X-Forwarded-For` lleva la IP resuelta del cliente. Si el upstream no responde, el proxy devuelve `502` con el cuerpo `upstream no disponible`.
+La respuesta reenviada incluye la ruta, el `Host`, el `Traceparent` que escribió guardian, `X-Forwarded-Host` y `X-Forwarded-Proto`. `X-Forwarded-For` lleva la IP resuelta del cliente. Si el upstream no responde, el proxy devuelve `502` con el cuerpo `upstream no disponible`.
 
 `/lento` sirve para ver el efecto de los timeouts: el upstream espera 10 segundos antes de escribir la respuesta.
 
