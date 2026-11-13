@@ -1,0 +1,34 @@
+groups:
+  - name: guardian
+    rules:
+      - alert: GuardianDown
+        expr: up{job="guardian"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "guardian no responde en /metrics"
+
+      - alert: GuardianHighErrorRate
+        expr: |
+          sum(rate(guardian_http_requests_total{code=~"5.."}[5m]))
+            / sum(rate(guardian_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Más del 5% de los requests terminan en 5xx"
+
+      - alert: GuardianHighLatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(guardian_http_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p99 por encima de 500 ms"
+
+      - alert: GuardianFailOpen
+        expr: sum by (reason) (rate(guardian_fail_open_total[5m])) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "guardian está usando el limitador local ({{ $labels.reason }}): revisa Valkey"

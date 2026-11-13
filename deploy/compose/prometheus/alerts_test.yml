@@ -1,0 +1,35 @@
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="guardian"}'
+        values: '1 1 0 0 0 0'
+      - series: 'guardian_fail_open_total{reason="timeout"}'
+        values: '0+10x10'
+      - series: 'guardian_http_requests_total{route="/api",method="GET",code="200"}'
+        values: '0+90x20'
+      - series: 'guardian_http_requests_total{route="/api",method="GET",code="502"}'
+        values: '0+10x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: GuardianDown
+        exp_alerts:
+          - exp_labels: { severity: critical, job: guardian }
+            exp_annotations: { summary: "guardian no responde en /metrics" }
+      - eval_time: 1m
+        alertname: GuardianDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: GuardianFailOpen
+        exp_alerts:
+          - exp_labels: { severity: warning, reason: timeout }
+            exp_annotations: { summary: "guardian está usando el limitador local (timeout): revisa Valkey" }
+      - eval_time: 10m
+        alertname: GuardianHighErrorRate
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations: { summary: "Más del 5% de los requests terminan en 5xx" }

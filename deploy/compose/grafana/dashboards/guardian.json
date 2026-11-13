@@ -1,0 +1,19 @@
+{
+    "uid": "guardian-overview",
+    "title": "guardian · overview",
+    "schemaVersion": 39,
+    "version": 1,
+    "refresh": "10s",
+    "tags": ["guardian"],
+    "time": {"from": "now-30m", "to": "now"},
+    "panels": [
+     {"id":1,"title":"Requests/s por route","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":0,"y":0,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"reqps"}},"targets":[{"refId":"A","expr":"sum by (route) (rate(guardian_http_requests_total[1m]))","legendFormat":"{{route}}"}]},
+     {"id":2,"title":"Error rate (5xx)","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":12,"y":0,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"percentunit"}},"targets":[{"refId":"A","expr":"(sum(rate(guardian_http_requests_total{code=~\"5..\"}[5m])) or vector(0)) / sum(rate(guardian_http_requests_total[5m]))","legendFormat":"5xx"}]},
+     {"id":3,"title":"Latencia p50 / p95 / p99","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":0,"y":8,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"refId":"A","expr":"histogram_quantile(0.5, sum by (le) (rate(guardian_http_request_duration_seconds_bucket[5m])))","legendFormat":"p50"},{"refId":"B","expr":"histogram_quantile(0.95, sum by (le) (rate(guardian_http_request_duration_seconds_bucket[5m])))","legendFormat":"p95"},{"refId":"C","expr":"histogram_quantile(0.99, sum by (le) (rate(guardian_http_request_duration_seconds_bucket[5m])))","legendFormat":"p99"}]},
+     {"id":4,"title":"Decisiones por tipo, mode y shadow","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":12,"y":8,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"refId":"A","expr":"sum by (decision, mode, shadow) (rate(guardian_decisions_total[5m]))","legendFormat":"{{decision}} · {{mode}} · shadow={{shadow}}"}]},
+     {"id":5,"title":"Habría bloqueado (block en shadow)","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":0,"y":16,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"refId":"A","expr":"sum(rate(guardian_decisions_total{decision=\"block\",shadow=\"true\"}[5m]))","legendFormat":"block en shadow"}]},
+     {"id":6,"title":"Top 5 signals","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":12,"y":16,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"refId":"A","expr":"topk(5, sum by (reason) (rate(guardian_signals_total[5m])))","legendFormat":"{{reason}}"}]},
+     {"id":7,"title":"Fail-open por reason","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":0,"y":24,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"ops"}},"targets":[{"refId":"A","expr":"sum by (reason) (rate(guardian_fail_open_total[5m]))","legendFormat":"{{reason}}"}]},
+     {"id":8,"title":"Requests en curso","type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"gridPos":{"x":12,"y":24,"w":12,"h":8},"fieldConfig":{"defaults":{"unit":"short"}},"targets":[{"refId":"A","expr":"guardian_http_requests_in_flight","legendFormat":"in flight"}]}
+    ]
+   }

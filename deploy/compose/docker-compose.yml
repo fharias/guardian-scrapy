@@ -1,0 +1,86 @@
+name: guardian
+
+services:
+  valkey:
+    image: valkey/valkey:9.1.3
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  upstream:
+    build:
+      context: ../..
+      args: { CMD: upstream }
+    image: guardian-upstream:dev
+
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    ports:
+      - "127.0.0.1:16686:16686"
+
+  guardian:
+    build:
+      context: ../..
+      args: { CMD: guardian, VERSION: dev }
+    image: guardian:dev
+    command: ["-config", "/etc/guardian/guardian.yml"]
+    environment:
+      GUARDIAN_PASS_KEYS: ${GUARDIAN_PASS_KEYS:?define GUARDIAN_PASS_KEYS en deploy/compose/.env}
+    volumes:
+      - ./guardian.yml:/etc/guardian/guardian.yml:ro
+    ports:
+      - "127.0.0.1:8080:8080"   # el 2112 NO se publica
+    depends_on:
+      valkey: { condition: service_healthy }
+      upstream: { condition: service_started }
+      jaeger: { condition: service_started }
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on: [guardian]
+
+  grafana:
+    image: grafana/grafana:13.0.12
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?define GRAFANA_ADMIN_PASSWORD en deploy/compose/.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on: [prometheus]
+
+  traffic:            # tráfico de demo: docker compose --profile demo up
+    profiles: ["demo"]
+    image: curlimages/curl:8.11.1
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        while true; do
+          curl -s -o /dev/null -A "Mozilla/5.0" http://guardian:8080/api/prices
+          curl -s -o /dev/null http://guardian:8080/api/prices
+          curl -s -o /dev/null -A "Mozilla/5.0" http://guardian:8080/
+          sleep 0.3
+        done
+    depends_on: [guardian]
+
+volumes:
+  prom-data:
+  grafana-data:

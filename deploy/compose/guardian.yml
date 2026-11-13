@@ -1,0 +1,77 @@
+listen: ":8080"
+upstream: "http://upstream:9000"
+read_header_timeout: 5s
+read_timeout: 20s
+write_timeout: 20s
+idle_timeout: 10s
+shutdown_timeout: 20s
+drain_delay: 5s
+preserve_host: true
+honeypot_paths:
+  - "/robots.txt"
+  - "/favicon.ico"
+  - "/admin-oculto"
+app: "shop"
+redis_addr: "localhost:6379"
+rate: 1
+burst: 2
+trusted_proxies:
+  - "10.0.0.0/8"
+  - "::1/128"
+  - "127.0.0.0/8"
+x_forwarded_for_header: "X-Forwarded-For"
+proxy_protocol: false
+scoring:
+  weights:
+    ua_tool: 90
+    headers_incomplete: 30
+    honeypot: 50
+    rate_exceeded: 100
+    low_browser_ratio: 15
+    fake_bot: 90
+    ja4_mismatch: 60
+  browser_ratio_min: 0.3
+  thresholds:
+    challenge: 40
+    block: 85
+rules:
+  honeypots: ["/admin-oculto", "/wp-login.php", "/.env"]
+  deny_cidrs: ["198.51.100.0/24"]
+  routes:
+    - prefix: /interno
+      allow_cidrs: ["10.0.0.0/8", "127.0.0.1/32"]
+good_bots:
+  - name: googlebot
+    ua_contains: Googlebot
+    domains: ["googlebot.com", "google.com"]
+  - name: bingbot
+    ua_contains: bingbot
+    domains: ["search.msn.com"]
+challenge:
+  difficulty: 16
+  ttl: 2m
+  pass_ttl: 1h
+modes:
+  default: enforce
+  routes:
+    - prefix: /api
+      mode: monitor          # regla nueva: primero medimos
+    - prefix: /api/checkout
+      mode: enforce
+    - prefix: /interno
+      mode: monitor
+#tls:
+#  listen: ":8443"
+#  cert_file: "certs/localhost.pem"
+#  key_file: "certs/localhost-key.pem"
+ja4:
+  source: "tls"
+  tools: 
+    - name: curl-mac
+      ja4: "t13d4907h2_0d8feac7bc37_7395dae3b2f3"
+tracing:
+  enabled: true
+  endpoint: "localhost:4318"   # Jaeger local, OTLP/HTTP
+  insecure: true               # solo local
+  sample_ratio: 1.0            # en local guardamos todo
+  trust_incoming: false
