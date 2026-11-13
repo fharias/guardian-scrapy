@@ -308,13 +308,15 @@ internal/rules/               honeypots, denegaciones y rutas
 internal/scoring/             pesos, umbrales y decisión
 internal/tlshello/            ClientHello y cálculo del JA4
 internal/verdict/             IP, huella, señales y decisión
-guardian-config.yml
+guardian-config.yml           ejemplo para go run, con TLS en :8443
+deploy/compose/               stack local: guardian, upstream, Valkey, Jaeger, Prometheus y Grafana
+Dockerfile                    imagen distroless de guardian o del upstream
 ```
 
 ## Requisitos
 
 - Go 1.27 o superior
-- Docker, para el Valkey local
+- Docker, para Valkey y Jaeger sueltos, y Docker Compose para el stack de `deploy/compose`
 
 ## Configuración
 
@@ -575,4 +577,68 @@ La respuesta reenviada incluye la ruta, el `Host`, el `Traceparent` que escribi�
 
 ```bash
 curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Accept-Encoding: gzip" http://localhost:8080/lento
+```
+
+## Stack local
+
+`deploy/compose/docker-compose.yml` levanta Valkey `9.1.3` sin persistencia, el upstream de prueba, Jaeger `2.23.0`, guardian, Prometheus `v3.16.0` y Grafana `13.0.12`. El perfil `demo` añade un bucle de `curl`.
+
+La imagen sale del `Dockerfile`: Go `1.27.4` sobre Alpine, binario estático y runtime `gcr.io/distroless/static-debian13:nonroot`. `CMD` elige `./cmd/guardian` o `./cmd/upstream`. `VERSION` se escribe en `main.version`; el compose la deja en `dev`. El contenedor de guardian monta el YAML en solo lectura, arranca con `read_only`, sin capabilities y con `no-new-privileges`.
+
+Los puertos publicados escuchan solo en `127.0.0.1`:
+
+| Servicio | Puerto en el host | Para qué |
+| --- | --- | --- |
+| guardian | `8080` | HTTP del proxy |
+| Jaeger | `16686` | UI en `http://localhost:16686` |
+| Prometheus | `9090` | UI y API |
+| Grafana | `3000` | UI. El alta de usuarios está cerrada |
+
+`:2112`, el OTLP `:4318`, Valkey `:6379` y el upstream `:9000` se quedan en la red de Compose. Prometheus lee `guardian:2112` cada 15 segundos, evalúa las reglas cada 15 segundos y guarda 7 días en el volumen `prom-data`.
+
+```mermaid
+flowchart LR
+  host["127.0.0.1"]
+  host -->|8080| guardian
+  host -->|16686| jaeger
+  host -->|9090| prometheus
+  host -->|3000| grafana
+  grafana --> prometheus
+  grafana --> jaeger
+  prometheus -->|"2112, red interna"| guardian
+  guardian --> upstream
+```
+
+`deploy/compose/guardian.yml` es el YAML de ejemplo con el upstream en `http://upstream:9000` y el bloque `tls` comentado, así que este stack no abre `:8443`. `redis_addr` sigue en `localhost:6379` y `tracing.endpoint` en `localhost:4318`. Dentro del contenedor esas direcciones son el propio guardian. Valkey es el servicio `valkey` y Jaeger recibe OTLP en `jaeger:4318`. Con el archivo tal como está, el límite de tasa usa el limitador en memoria y los spans no llegan a Jaeger.
+
+Hace falta `deploy/compose/.env`, a partir de `.env.example`. Compose no arranca si faltan `GUARDIAN_PASS_KEYS` o `GRAFANA_ADMIN_PASSWORD`. El `.env` no se versiona.
+
+```bash
+cd deploy/compose
+cp .env.example .env
+# GUARDIAN_PASS_KEYS=k1:$(openssl rand -base64 32 | tr -d '\n')
+docker compose up --build
+```
+
+El perfil `demo` pega tres peticiones cada 0,3 segundos: `Mozilla/5.0` a `/api/prices`, `curl` sin otro user-agent a `/api/prices`, y `Mozilla/5.0` a `/`.
+
+```bash
+docker compose --profile demo up --build
+```
+
+Grafana provisiona Prometheus como datasource por defecto y Jaeger en `http://jaeger:16686`. El dashboard `guardian · overview` (`uid` `guardian-overview`) refresca cada 10 segundos y mira los últimos 30 minutos: requests por ruta, ratio de 5xx, latencia p50/p95/p99, decisiones por tipo, modo y shadow, bloqueos que habrían ocurrido en shadow, las cinco señales más frecuentes, fail-open por motivo y requests en curso. La UI no puede borrar ni editar ese dashboard.
+
+`deploy/compose/prometheus/alerts.yml` define cuatro alertas del job `guardian`:
+
+| Alerta | Condición | Durante | Severidad |
+| --- | --- | --- | --- |
+| `GuardianDown` | `up == 0` | 1 minuto | `critical` |
+| `GuardianHighErrorRate` | más del 5 % de los requests en 5xx | 5 minutos | `critical` |
+| `GuardianHighLatencyP99` | p99 por encima de 500 ms | 10 minutos | `warning` |
+| `GuardianFailOpen` | algún `guardian_fail_open_total` en la ventana de 5 minutos | 2 minutos | `warning` |
+
+`alerts_test.yml` es la prueba de `promtool` y Prometheus no la carga. Se corre desde `deploy/compose/prometheus`:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work prom/prometheus:v3.16.0 promtool test rules alerts_test.yml
 ```
