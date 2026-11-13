@@ -54,7 +54,7 @@ La cadena se ejecuta en este orden. `Logger` envuelve al resto y escribe el vere
 
 ```mermaid
 flowchart LR
-  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
@@ -65,6 +65,7 @@ flowchart LR
 | Configuración | `internal/config` | Carga y validación del YAML |
 | IP del cliente | `internal/clientip` | Elige la IP real a partir del peer y de la cabecera configurada |
 | Huella | `internal/fingerprint` | Resume las cabeceras y compara el JA4 con herramientas conocidas |
+| Origen del JA4 | `internal/ja4source` | Elige el JA4 del ClientHello, de CloudFront o de ninguno |
 | Reglas | `internal/rules` | Honeypots, CIDR denegados y rutas con allowlist |
 | Bots | `internal/goodbot` | Comprueba por DNS los user-agent que dicen ser un bot conocido |
 | Puntaje | `internal/scoring` | Convierte las señales en score y decisión |
@@ -105,7 +106,28 @@ Si el `User-Agent` contiene `Mozilla/` y falta `Accept`, `Accept-Language` o `Ac
 
 En HTTPS, `tlshello` calcula el JA4 de lo que el cliente ofreció, sin contar GREASE. La forma es `A_B_C`: `A` tiene 10 caracteres (protocolo `t`, versión, `d` si hay SNI o `i` si no, cantidad de ciphers, cantidad de extensiones y ALPN), `B` son 12 hexadecimales del hash de los ciphers ordenados y `C` son 12 hexadecimales del hash de las extensiones ordenadas, sin SNI ni ALPN, más los algoritmos de firma en el orden en que llegaron. `ja4_r` trae esas listas en claro y ordenadas. `ja4_ro` las trae en el orden original.
 
-`JA4Mismatch` marca `ja4_incoherente` cuando el `User-Agent` empieza por `Mozilla/` y el JA4 está en `ja4.tools`. Un `curl` que deja su propio `User-Agent` no entra por aquí: ya lo cubre `ua_herramienta`. En HTTP plano no hay ClientHello, así que no hay señal. Cada entrada necesita `name` y un JA4 con la forma `10_12_12`. Un JA4 repetido hace fallar el arranque. El ejemplo trae el JA4 medido de curl en macOS; cambia con la versión y con la librería TLS.
+`ja4.source` dice de dónde sale ese valor. Si se omite, vale `tls`.
+
+| `source` | De dónde sale el JA4 |
+| --- | --- |
+| `tls` | Del ClientHello que ve guardian. En HTTP plano no hay valor |
+| `cloudfront` | Del header `CloudFront-Viewer-JA4-Fingerprint`, si el vecino TCP está en `trusted_proxies`. Si el header no está, se repite, no tiene la forma `10_12_12` o el vecino no es de confianza, se usa el ClientHello |
+| `none` | No hay JA4 y la señal queda apagada |
+
+`cloudfront` exige que `trusted_proxies` no esté vacío. El header solo se cree del peer inmediato, no de la IP del cliente ya resuelta. Un header descartado deja un aviso `ja4_header_rechazado` con el motivo `peer_no_confiable`, `formato_invalido` o `header_repetido`. Después de decidir, guardian borra ese header para que el upstream no lo vea. `POST /__guardian/verify` también pasa por ese paso.
+
+```mermaid
+flowchart TD
+  origen{ja4.source} -->|tls| hello[ClientHello]
+  origen -->|none| vacio[Sin JA4]
+  origen -->|cloudfront| peer{Peer en trusted_proxies y un solo header valido}
+  peer -->|si| header[Header de CloudFront]
+  peer -->|no| hello
+```
+
+`JA4Mismatch` marca `ja4_incoherente` cuando el `User-Agent` empieza por `Mozilla/` y el JA4 elegido está en `ja4.tools`. Un `curl` que deja su propio `User-Agent` no entra por aquí: ya lo cubre `ua_herramienta`. Cada entrada necesita `name` y un JA4 en minúsculas con la forma `10_12_12`. Un JA4 repetido o un `source` distinto de `tls`, `cloudfront` y `none` hace fallar el arranque. El ejemplo trae el JA4 medido de curl en macOS; cambia con la versión y con la librería TLS.
+
+`guardian-cf.yml` usa `source: cloudfront` y trata como vecinos de confianza a `10.0.0.0/8`, `127.0.0.0/8` y `::1`. `guardian-cf-untrusted.yml` deja fuera a localhost, así que un header enviado desde la máquina local se descarta.
 
 ### Reglas y bots
 
@@ -171,7 +193,7 @@ En `enforce`, `block` responde `403` con el cuerpo `acceso denegado`. Un pase no
 
 Cuando la decisión es `challenge`, busca la cookie `guardian_pass`. Si el pase está firmado, vigente y atado a la misma IP y a la misma huella, agrega el motivo `pase_valido` y sigue al upstream. Si no hay pase, responde `403` con una página HTML que resuelve en el navegador una prueba de trabajo SHA-256: busca un nonce cuyo hash de `semilla + nonce` tenga al menos `challenge.difficulty` bits en cero a la izquierda.
 
-El formulario hace `POST /__guardian/verify` con el token, el nonce y la ruta de vuelta. Esa ruta pasa por `Init`, `ClientIP`, `Logger` y `Fingerprint`. El canje exige un POST; otro método responde `405`. El token tiene que estar firmado, dentro de `challenge.ttl`, atado a la IP y a la huella de esa petición, y el nonce no puede pasar de 20 caracteres. Si la prueba cierra, el proxy deja la cookie y responde `303` hacia `next`. `next` tiene que ser una ruta relativa que empiece por `/`. Una URL absoluta, `//...` o un valor que no es una ruta vuelve a `/`.
+El formulario hace `POST /__guardian/verify` con el token, el nonce y la ruta de vuelta. Esa ruta pasa por `Init`, `ClientIP`, `Logger`, `Fingerprint` y `JA4`. El canje exige un POST; otro método responde `405`. El token tiene que estar firmado, dentro de `challenge.ttl`, atado a la IP y a la huella de esa petición, y el nonce no puede pasar de 20 caracteres. Si la prueba cierra, el proxy deja la cookie y responde `303` hacia `next`. `next` tiene que ser una ruta relativa que empiece por `/`. Una URL absoluta, `//...` o un valor que no es una ruta vuelve a `/`.
 
 La cookie es `HttpOnly`, `SameSite=Lax`, con `Path=/` y `Max-Age` igual a `challenge.pass_ttl`. Lleva `Secure` cuando la petición llega por TLS. El pase queda atado a la IP y a la huella, así que otra IP o unas cabeceras distintas no lo reutilizan.
 
@@ -228,7 +250,7 @@ flowchart TD
 
 Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. En HTTPS suma `tls_version`, `sni` y `ja4`.
+El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. Si hubo un origen de JA4, suma `ja4` y `ja4_source`. En HTTPS suma también `tls_version` y `sni`.
 
 ### HTTPS y ClientHello
 
@@ -245,6 +267,7 @@ internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
 internal/fingerprint/         huella HTTP y política JA4
+internal/ja4source/           origen del JA4: tls, cloudfront o none
 internal/goodbot/             verificación DNS de bots conocidos
 internal/middleware/          cadena, señales, desafío y modo
 internal/policy/              monitor o enforce por prefijo
@@ -333,6 +356,7 @@ tls:
   cert_file: "certs/localhost.pem"
   key_file: "certs/localhost-key.pem"
 ja4:
+  source: "tls"
   tools:
     - name: curl-mac
       ja4: "t13d4907h2_0d8feac7bc37_7395dae3b2f3"
@@ -374,7 +398,8 @@ ja4:
 | `tls.cert_file` | no | vacío | Certificado PEM. Obligatorio si el bloque `tls` está activo |
 | `tls.key_file` | no | vacío | Clave privada PEM. Obligatoria si el bloque `tls` está activo |
 | `scoring.weights.ja4_mismatch` | no | 0 | Puntos cuando un `User-Agent` de navegador trae un JA4 de `ja4.tools` |
-| `ja4.tools` | no | vacío | JA4 medidos de herramientas, con `name` y `ja4` |
+| `ja4.source` | no | `tls` | `tls`, `cloudfront` o `none` |
+| `ja4.tools` | no | vacío | JA4 medidos de herramientas, con `name` y `ja4` en minúsculas |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -387,7 +412,8 @@ La carga también rechaza la configuración cuando:
 - `challenge.difficulty` está fuera del intervalo de 8 a 24.
 - `modes.default` está vacío, no es `monitor` ni `enforce`, o dos rutas quedan con el mismo prefijo.
 - el bloque `tls` está a medias: falta `listen`, `cert_file` o `key_file`.
-- una entrada de `ja4.tools` no tiene `name`, el JA4 no tiene la forma `10_12_12` o el mismo JA4 aparece dos veces.
+- `ja4.source` no es `tls`, `cloudfront` ni `none`, o `cloudfront` se usa sin `trusted_proxies`.
+- una entrada de `ja4.tools` no tiene `name`, el JA4 no tiene la forma `10_12_12` en minúsculas o el mismo JA4 aparece dos veces.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase.
 
