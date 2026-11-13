@@ -77,3 +77,15 @@ func matches(prefix, path string) bool {
 	}
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
+
+// Route devuelve el prefix configurado que gana para este path
+// (el mismo que usa For) o "default" si ninguno aplica.
+// Sirve como label de métricas: su cardinalidad está acotada por el YAML.
+func (m *Modes) Route(path string) string {
+	for _, r := range m.routes {
+		if matches(r.Prefix, path) {
+			return r.Prefix
+		}
+	}
+	return "default"
+}

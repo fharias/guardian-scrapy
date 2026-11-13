@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/pires/go-proxyproto"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -26,6 +28,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/ja4source"
+	"github.com/fharias/guardian-scrapy/internal/metrics"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
@@ -81,7 +84,8 @@ func main() {
 	go func() {
 		m := http.NewServeMux()
 		m.Handle("/metrics", promhttp.Handler())
-		if err := http.ListenAndServe(":2112", m); err != nil {
+		ms := &http.Server{Addr: ":2112", Handler: m, ReadHeaderTimeout: 5 * time.Second}
+		if err := ms.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("servidor de métricas", "err", err)
 		}
 	}()
@@ -127,6 +131,11 @@ func main() {
 		logger.Error("modes", "err", err)
 		os.Exit(1)
 	}
+	mets := metrics.New(prometheus.DefaultRegisterer)
+	if err != nil {
+		logger.Error("metrics", "err", err)
+		os.Exit(1)
+	}
 	ja4Policy, err := fingerprint.NewJA4Policy(cfg.JA4)
 	if err != nil {
 		logger.Error("ja4", "err", err)
@@ -139,6 +148,7 @@ func main() {
 	}
 	protected := middleware.Chain(proxy,
 		middleware.Init,
+		mets.Middleware(modes.Route),
 		middleware.ClientIP(clientipResolver),
 		middleware.Logger(logger),
 		middleware.SuspiciousUA(),
