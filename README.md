@@ -50,11 +50,11 @@ flowchart LR
   reverso --> origen
 ```
 
-La cadena se ejecuta en este orden. `Logger` envuelve al resto y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
+La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del resto. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
 
 ```mermaid
 flowchart LR
-  init[Init] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+  init[Init] --> mets[Metrics] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
@@ -70,8 +70,9 @@ flowchart LR
 | Bots | `internal/goodbot` | Comprueba por DNS los user-agent que dicen ser un bot conocido |
 | Puntaje | `internal/scoring` | Convierte las señales en score y decisión |
 | Desafío | `internal/challenge` | Prueba de trabajo, tokens HMAC y pase firmado |
-| Modos | `internal/policy` | Elige `monitor` o `enforce` según el prefijo más largo |
+| Modos | `internal/policy` | Elige `monitor` o `enforce` según el prefijo más largo y ese prefijo es el label `route` |
 | Middleware | `internal/middleware` | Cadena, señales, página de desafío y corte en `block` |
+| Métricas | `internal/metrics` | Contadores, histograma y gauge de la cadena protegida |
 | Veredicto | `internal/verdict` | IP, huella, señales, score y decisión |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
@@ -269,8 +270,9 @@ internal/config/              carga y validación del YAML
 internal/fingerprint/         huella HTTP y política JA4
 internal/ja4source/           origen del JA4: tls, cloudfront o none
 internal/goodbot/             verificación DNS de bots conocidos
+internal/metrics/             RED, decisiones y señales de Prometheus
 internal/middleware/          cadena, señales, desafío y modo
-internal/policy/              monitor o enforce por prefijo
+internal/policy/              monitor o enforce por prefijo; label route
 internal/ratelimit/           Valkey, memoria y failover
 internal/rules/               honeypots, denegaciones y rutas
 internal/scoring/             pesos, umbrales y decisión
@@ -440,7 +442,20 @@ sequenceDiagram
 
 El limitador en memoria limpia cada minuto las claves que ya recuperaron el burst completo. Esa limpieza se detiene con la misma señal.
 
-`GET /metrics` en `:2112` expone las métricas de Prometheus, incluido `guardian_fail_open_total`.
+`GET /metrics` en `:2112` expone Prometheus. Ese servidor tiene `ReadHeaderTimeout` de 5 segundos y no entra en el `Shutdown` de HTTP ni de HTTPS: sigue hasta que el proceso sale. `/healthz`, `/readyz` y `POST /__guardian/verify` no pasan por el middleware de métricas. La cadena protegida sí.
+
+El label `route` es el prefijo de `modes.routes` que gana para esa ruta, el mismo criterio que el modo: el más largo, con barra final recortada, y la ruta tiene que coincidir entera o seguir con `/`. Si ninguno aplica, el label es `default`. Con el YAML de ejemplo, `/api/precios` queda en `/api`, `/api/checkout/pagar` queda en `/api/checkout` y `/salud` queda en `default`. La query no entra en el label.
+
+El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPTIONS`. Cualquier otro queda en `OTHER`. El status es el que escribe el handler; si no llama a `WriteHeader`, el contador usa `200`. El wrapper del response deja ver el `ResponseWriter` original, así el reverse proxy puede hacer flush y el upstream sigue pudiendo transmitir.
+
+| Métrica | Tipo | Labels | Qué cuenta |
+| --- | --- | --- | --- |
+| `guardian_http_requests_total` | counter | `route`, `method`, `code` | Peticiones que salen de la cadena protegida |
+| `guardian_http_request_duration_seconds` | histogram | `route`, `method` | Tiempo dentro de guardian, incluido el upstream. Buckets: 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 2.5 s y 5 s |
+| `guardian_http_requests_in_flight` | gauge | — | Peticiones que aún no han vuelto del resto de la cadena |
+| `guardian_decisions_total` | counter | `decision`, `mode`, `shadow` | Decisión leída del veredicto. `shadow` vale `true` o `false`. Un modo vacío queda en `none` |
+| `guardian_signals_total` | counter | `reason` | Cada motivo que el veredicto trae en `Reasons` |
+| `guardian_fail_open_total` | counter | `reason` | Saltos al limitador en memoria: `timeout`, `error` o `circuit_open` |
 
 ## Ejecutar
 
