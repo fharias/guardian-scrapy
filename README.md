@@ -55,8 +55,9 @@ flowchart LR
 La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del resto. `Trace` abre el span raíz y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
 
 ```mermaid
-flowchart LR
-  init[Init] --> mets[Metrics] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+flowchart TD
+  init[Init] --> mets[Metrics] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint]
+  fp --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
