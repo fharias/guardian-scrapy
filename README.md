@@ -52,12 +52,12 @@ flowchart LR
   reverso --> origen
 ```
 
-La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del resto. `Trace` abre el span raíz y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
+La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del resto. `Events` emite el veredicto ya cerrado, también al volver. `Trace` abre el span raíz, copia su `trace_id` al veredicto y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
 
 ```mermaid
 flowchart TD
-  init[Init] --> mets[Metrics] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA] --> fp[Fingerprint]
-  fp --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+  init[Init] --> mets[Metrics] --> events[Events] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA]
+  ua --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
@@ -77,7 +77,8 @@ flowchart TD
 | Middleware | `internal/middleware` | Cadena, señales, página de desafío y corte en `block` |
 | Métricas | `internal/metrics` | Contadores, histograma y gauge de la cadena protegida |
 | Trazas | `internal/tracing` | Exporter OTLP/HTTP, muestreo y `Traceparent` hacia el upstream |
-| Veredicto | `internal/verdict` | IP, huella, señales, score y decisión |
+| Eventos | `internal/events` | Veredicto hacia un sink, con la IP en HMAC y un buffer que descarta si se llena |
+| Veredicto | `internal/verdict` | IP, huella, señales, score, decisión y `trace_id` |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
 ### IP del cliente
@@ -281,7 +282,23 @@ flowchart TD
   root --> i[mw.enforce]
 ```
 
-`trust_incoming` solo lee el `Traceparent` entrante cuando además el peer TCP inmediato está en `trusted_proxies`. Con el ejemplo en `false`, un `Traceparent` de `127.0.0.1` abre una traza nueva. Antes de reenviar, guardian borra `Traceparent`, `Tracestate` y `Baggage` del request saliente y escribe el `Traceparent` del span raíz. El upstream de prueba lo imprime en el cuerpo.
+`trust_incoming` solo lee el `Traceparent` entrante cuando además el peer TCP inmediato está en `trusted_proxies`. Con el ejemplo en `false`, un `Traceparent` de `127.0.0.1` abre una traza nueva. Antes de reenviar, guardian borra `Traceparent`, `Tracestate` y `Baggage` del request saliente y escribe el `Traceparent` del span raíz. El upstream de prueba lo imprime en el cuerpo. Al abrir el span, si el contexto es válido, `Trace` guarda ese `trace_id` en el veredicto. El evento lo lee de ahí al volver de la cadena.
+
+### Eventos
+
+`events.enabled` en falso no exige sal y el paso no emite nada. El ejemplo lo deja en verdadero, con sink `log` y un buffer de 1024. Un buffer 0 o ausente también vale 1024. Ese tamaño cabe cerca de un segundo a 1000 peticiones por segundo.
+
+El evento sale cuando la cadena protegida ya volvió. `/healthz`, `/readyz` y `POST /__guardian/verify` no lo generan. Lleva la hora UTC, `ip_hash`, `ja4`, `ja4_source`, `fingerprint`, `route`, `method`, `score`, `decision`, `reasons`, `mode`, `shadow` y `trace_id`. `route` es el mismo prefijo que usan las métricas. `method` es el de la petición, sin pasar por la normalización de Prometheus. Un modo vacío queda en `none`.
+
+`ip_hash` es el HMAC-SHA256 de la IP, con `GUARDIAN_EVENT_SALT` como clave, recortado a 16 bytes y escrito en hexadecimal. La sal mide al menos 16 caracteres. Una IP inválida deja el campo vacío. Cambiar la sal deja de coincidir con los hashes anteriores. El evento no trae la IP. El log `request` sigue llevando `client_ip`.
+
+```bash
+export GUARDIAN_EVENT_SALT="$(openssl rand -hex 32)"
+```
+
+El sink `log` escribe una línea JSON con el mensaje `event`. El sink `none` recorre el mismo buffer y no escribe esa línea. `sqs`, `kinesis` y `kafka` hacen fallar el arranque.
+
+`Emit` no espera al destino. Si el canal está lleno, descarta el evento y suma `guardian_events_dropped_total` con el motivo `buffer_full`. Si el sink ya cerró, el motivo es `closed`. Un error del destino, ya con el evento fuera del canal, suma `guardian_events_sink_errors_total`.
 
 ### HTTPS y ClientHello
 
@@ -297,6 +314,7 @@ cmd/upstream/                 binario de prueba
 internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
+internal/events/              evento del veredicto, HMAC de la IP y buffer
 internal/fingerprint/         huella HTTP y política JA4
 internal/ja4source/           origen del JA4: tls, cloudfront o none
 internal/goodbot/             verificación DNS de bots conocidos
@@ -440,6 +458,9 @@ ja4:
 | `tracing.insecure` | no | `false` | HTTP plano hacia el colector |
 | `tracing.sample_ratio` | no | `0` | Fracción de trazas nuevas, de 0 a 1. El ejemplo usa `1` |
 | `tracing.trust_incoming` | no | `false` | Continúa el `Traceparent` de un peer en `trusted_proxies` |
+| `events.enabled` | no | `false` | Emite un evento por petición de la cadena protegida |
+| `events.sink` | no | `log` | `log` escribe una línea JSON. `none` descarta el destino. Otro valor falla el arranque |
+| `events.buffer` | no | `1024` | Capacidad del canal. `0` vuelve a 1024. Un valor negativo falla el arranque |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -455,8 +476,10 @@ La carga también rechaza la configuración cuando:
 - `ja4.source` no es `tls`, `cloudfront` ni `none`, o `cloudfront` se usa sin `trusted_proxies`.
 - una entrada de `ja4.tools` no tiene `name`, el JA4 no tiene la forma `10_12_12` en minúsculas o el mismo JA4 aparece dos veces.
 - `tracing.enabled` es verdadero y falta `tracing.endpoint`, o `tracing.sample_ratio` queda fuera de 0 a 1.
+- `events.enabled` es verdadero y `events.sink` no es `log` ni `none`, o `events.buffer` es negativo.
+- `events.enabled` es verdadero y `GUARDIAN_EVENT_SALT` mide menos de 16 caracteres.
 
-`GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase.
+`GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase. `GUARDIAN_EVENT_SALT` es obligatoria solo cuando `events.enabled` es verdadero.
 
 ## Salud y apagado
 
@@ -472,6 +495,7 @@ sequenceDiagram
   G->>G: /healthz pasa a 503
   G->>G: espera drain_delay
   G->>C: Shutdown de HTTP y HTTPS durante shutdown_timeout
+  G->>G: vacía el buffer de eventos con el tiempo que quede de ese plazo
   G->>G: vacía los spans con el tiempo que quede de ese plazo
   alt terminan a tiempo
     G->>G: apagado limpio
@@ -496,6 +520,10 @@ El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPT
 | `guardian_decisions_total` | counter | `decision`, `mode`, `shadow` | Decisión leída del veredicto. `shadow` vale `true` o `false`. Un modo vacío queda en `none` |
 | `guardian_signals_total` | counter | `reason` | Cada motivo que el veredicto trae en `Reasons` |
 | `guardian_fail_open_total` | counter | `reason` | Saltos al limitador en memoria: `timeout`, `error` o `circuit_open` |
+| `guardian_events_enqueued_total` | counter | — | Eventos que entraron al buffer |
+| `guardian_events_dropped_total` | counter | `reason` | Descartados: `buffer_full` o `closed`. Las dos series existen desde el arranque |
+| `guardian_events_sink_errors_total` | counter | — | Errores del destino al escribir un evento ya sacado del buffer |
+| `guardian_events_buffer_length` | gauge | — | Eventos esperando en el canal |
 
 ## Ejecutar
 
@@ -536,6 +564,7 @@ Antes de arrancar el proxy hace falta el llavero. La primera llave firma; se pue
 
 ```bash
 export GUARDIAN_PASS_KEYS="k1:$(openssl rand -base64 32 | tr -d '\n')"
+export GUARDIAN_EVENT_SALT="$(openssl rand -hex 32)"
 ```
 
 El YAML de ejemplo enciende HTTPS en `:8443`. Sin estos archivos el proceso no arranca:
@@ -612,12 +641,13 @@ flowchart LR
 
 `deploy/compose/guardian.yml` es el YAML de ejemplo con el upstream en `http://upstream:9000` y el bloque `tls` comentado, así que este stack no abre `:8443`. `redis_addr` sigue en `localhost:6379` y `tracing.endpoint` en `localhost:4318`. Dentro del contenedor esas direcciones son el propio guardian. Valkey es el servicio `valkey` y Jaeger recibe OTLP en `jaeger:4318`. Con el archivo tal como está, el límite de tasa usa el limitador en memoria y los spans no llegan a Jaeger.
 
-Hace falta `deploy/compose/.env`, a partir de `.env.example`. Compose no arranca si faltan `GUARDIAN_PASS_KEYS` o `GRAFANA_ADMIN_PASSWORD`. El `.env` no se versiona.
+Hace falta `deploy/compose/.env`, a partir de `.env.example`. Compose no arranca si faltan `GUARDIAN_PASS_KEYS`, `GRAFANA_ADMIN_PASSWORD` o `GUARDIAN_EVENT_SALT`. El YAML del stack deja `events.enabled` en verdadero, así que esa sal tiene que medir al menos 16 caracteres. El `.env` no se versiona.
 
 ```bash
 cd deploy/compose
 cp .env.example .env
 # GUARDIAN_PASS_KEYS=k1:$(openssl rand -base64 32 | tr -d '\n')
+# GUARDIAN_EVENT_SALT=$(openssl rand -hex 32)
 docker compose up --build
 ```
 
@@ -627,7 +657,7 @@ El perfil `demo` pega tres peticiones cada 0,3 segundos: `Mozilla/5.0` a `/api/p
 docker compose --profile demo up --build
 ```
 
-Grafana provisiona Prometheus como datasource por defecto y Jaeger en `http://jaeger:16686`. El dashboard `guardian · overview` (`uid` `guardian-overview`) refresca cada 10 segundos y mira los últimos 30 minutos: requests por ruta, ratio de 5xx, latencia p50/p95/p99, decisiones por tipo, modo y shadow, bloqueos que habrían ocurrido en shadow, las cinco señales más frecuentes, fail-open por motivo y requests en curso. La UI no puede borrar ni editar ese dashboard.
+Grafana provisiona Prometheus como datasource por defecto y Jaeger en `http://jaeger:16686`. El dashboard `guardian · overview` (`uid` `guardian-overview`) refresca cada 10 segundos y mira los últimos 30 minutos: requests por ruta, ratio de 5xx, latencia p50/p95/p99, decisiones por tipo, modo y shadow, bloqueos que habrían ocurrido en shadow, las cinco señales más frecuentes, fail-open por motivo, requests en curso y eventos encolados frente a descartados. La UI no puede borrar ni editar ese dashboard.
 
 `deploy/compose/prometheus/alerts.yml` define cuatro alertas del job `guardian`:
 
