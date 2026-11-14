@@ -47,6 +47,7 @@ type Verdict struct {
 	Mode        string
 	Shadowed    bool
 	JA4         string
+	TraceID     string
 	JA4Source   string // de dónde salió: tls, cloudfront o none (paso 15)
 }
 

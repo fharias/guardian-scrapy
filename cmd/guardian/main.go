@@ -25,6 +25,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/challenge"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
+	"github.com/fharias/guardian-scrapy/internal/events"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/ja4source"
@@ -141,6 +142,11 @@ func main() {
 		os.Exit(1)
 	}
 	mets := metrics.New(prometheus.DefaultRegisterer)
+	closeEvents, emitMW, err := setupEvents(cfg.Events, logger, modes.Route)
+	if err != nil {
+		logger.Error("events", "err", err)
+		os.Exit(1)
+	}
 	ja4Policy, err := fingerprint.NewJA4Policy(cfg.JA4)
 	if err != nil {
 		logger.Error("ja4", "err", err)
@@ -158,6 +164,7 @@ func main() {
 	protected := middleware.Chain(proxy,
 		middleware.Init,
 		mets.Middleware(modes.Route),
+		emitMW,
 		middleware.Trace(tracer, middleware.TraceOptions{
 			Route: modes.Route,
 			TrustIncoming: func(r *http.Request) bool {
@@ -284,9 +291,31 @@ func main() {
 			log.Printf("apagado forzado: %v", err)
 		}
 	}
+	if err := closeEvents(shutdownCtx); err != nil {
+		log.Printf("events: no pude vaciar el buffer: %v", err)
+	}
 	if err := shutdownTracing(shutdownCtx); err != nil {
 		log.Printf("tracing: no pude vaciar los spans: %v", err)
 	}
 	log.Println("apagado limpio")
 
+}
+func setupEvents(cfg events.Config, logger *slog.Logger, route events.RouteFunc) (func(context.Context) error, middleware.Middleware, error) {
+	noopClose := func(context.Context) error { return nil }
+	passthrough := func(next http.Handler) http.Handler { return next }
+	if !cfg.Enabled {
+		logger.Info("events", "enabled", false)
+		return noopClose, passthrough, nil
+	}
+	hasher, err := events.NewHasher(os.Getenv("GUARDIAN_EVENT_SALT"))
+	if err != nil {
+		return noopClose, passthrough, err
+	}
+	dest, err := events.NewSink(cfg, logger)
+	if err != nil {
+		return noopClose, passthrough, err
+	}
+	async := events.NewAsync(dest, cfg, prometheus.DefaultRegisterer)
+	logger.Info("events", "enabled", true, "sink", cfg.WithDefaults().Sink, "buffer", cfg.WithDefaults().Buffer)
+	return async.Close, events.Middleware(async, hasher, route), nil
 }

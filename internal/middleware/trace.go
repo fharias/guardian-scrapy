@@ -42,7 +42,9 @@ func Trace(tr trace.Tracer, o TraceOptions) Middleware {
 				),
 			)
 			defer span.End()
-
+			if v := verdict.From(ctx); v != nil && span.SpanContext().IsValid() {
+				v.TraceID = span.SpanContext().TraceID().String()
+			}
 			sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r.WithContext(ctx))
 

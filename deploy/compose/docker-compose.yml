@@ -29,6 +29,7 @@ services:
     command: ["-config", "/etc/guardian/guardian.yml"]
     environment:
       GUARDIAN_PASS_KEYS: ${GUARDIAN_PASS_KEYS:?define GUARDIAN_PASS_KEYS en deploy/compose/.env}
+      GUARDIAN_EVENT_SALT: ${GUARDIAN_EVENT_SALT:?define GUARDIAN_EVENT_SALT en deploy/compose/.env}
     volumes:
       - ./guardian.yml:/etc/guardian/guardian.yml:ro
     ports:

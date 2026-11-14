@@ -75,3 +75,7 @@ tracing:
   insecure: true               # solo local
   sample_ratio: 1.0            # en local guardamos todo
   trust_incoming: false
+events:
+  enabled: true
+  sink: log
+  buffer: 1024

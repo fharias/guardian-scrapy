@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/clientip"
+	"github.com/fharias/guardian-scrapy/internal/events"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/policy"
@@ -51,6 +52,7 @@ type Config struct {
 	TLS                 TLSConfig             `yaml:"tls"`
 	JA4                 fingerprint.JA4Config `yaml:"ja4"`
 	Tracing             tracing.Config        `yaml:"tracing"`
+	Events              events.Config         `yaml:"events"`
 	UpstreamURL         *url.URL              `yaml:"-"`
 }
 
@@ -99,6 +101,7 @@ func Load(path string) (*Config, error) {
 		Rate:              1,
 		Burst:             10,
 		JA4:               fingerprint.JA4Config{Source: fingerprint.SourceTLS},
+		Events:            events.Config{Sink: events.SinkLog, Buffer: events.DefaultBuffer},
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -176,6 +179,9 @@ func (c *Config) validate() error {
 		errs = append(errs, err)
 	}
 	if err := c.Tracing.Validate(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := c.Events.Validate(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
