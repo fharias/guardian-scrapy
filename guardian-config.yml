@@ -77,5 +77,16 @@ tracing:
   trust_incoming: false
 events:
   enabled: true
-  sink: log                 # log | none (sqs, kinesis, kafka: pasos 20 y 22)
+  sink: log                 # log | none | sqs | kinesis | kafka
   buffer: 1024
+  # Solo para sqs y kinesis. Si los omites, valen estos defaults:
+  # batch_size: 100         # eventos por batch (máximo 500)
+  # flush_interval: 1s      # un batch incompleto sale igual cada segundo
+  # max_retries: 3          # retries de lo que falló dentro del batch
+  # retry_backoff: 100ms    # espera base; se duplica en cada retry
+  # sqs:
+  #   queue_url: "http://localhost:4566/000000000000/guardian-events"
+  # kinesis:
+  #   stream_name: "guardian-events"
+  # El endpoint, la región y las credenciales NO van aquí: salen de
+  # AWS_ENDPOINT_URL, AWS_REGION, AWS_ACCESS_KEY_ID y AWS_SECRET_ACCESS_KEY.

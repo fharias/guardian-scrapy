@@ -2,7 +2,7 @@
   "uid": "guardian-overview",
   "title": "guardian \u00b7 overview",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "refresh": "10s",
   "tags": [
     "guardian"
@@ -267,6 +267,70 @@
           "refId": "B",
           "expr": "sum by (reason) (rate(guardian_events_dropped_total[5m]))",
           "legendFormat": "dropped {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Batches por segundo y eventos por batch",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (sink) (rate(guardian_events_batches_total[5m]))",
+          "legendFormat": "batches/s {{sink}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (sink) (rate(guardian_events_batch_size_sum[5m])) / sum by (sink) (rate(guardian_events_batch_size_count[5m]))",
+          "legendFormat": "eventos por batch {{sink}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Retries y eventos perdidos",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (sink) (rate(guardian_events_retries_total[5m]))",
+          "legendFormat": "retries {{sink}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (sink) (rate(guardian_events_send_failures_total[5m]))",
+          "legendFormat": "perdidos {{sink}}"
         }
       ]
     }

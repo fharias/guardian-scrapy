@@ -55,17 +55,54 @@ func TestHasherIsDeterministicAndHidesIP(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
-	if err := (Config{Enabled: false, Sink: "sqs"}).Validate(); err != nil {
-		t.Fatalf("disabled no debe validar el sink: %v", err)
+	sqsOK := SQSConfig{QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/guardian-events"}
+	cases := []struct {
+		name    string
+		cfg     Config
+		wantErr string // vacío = debe validar
+	}{
+		{"disabled no valida el sink", Config{Enabled: false, Sink: "sqs"}, ""},
+		{"log", Config{Enabled: true, Sink: "log", Buffer: 8}, ""},
+		{"none", Config{Enabled: true, Sink: "none"}, ""},
+		{"sqs completo", Config{Enabled: true, Sink: "sqs", SQS: sqsOK, BatchSize: 10, FlushInterval: time.Second}, ""},
+		{"sqs sin queue_url", Config{Enabled: true, Sink: "sqs"}, "events.sqs.queue_url"},
+		{"sqs con url sin esquema", Config{Enabled: true, Sink: "sqs", SQS: SQSConfig{QueueURL: "guardian-events"}}, "events.sqs.queue_url"},
+		{"kinesis completo", Config{Enabled: true, Sink: "kinesis", Kinesis: KinesisConfig{StreamName: "guardian-events"}}, ""},
+		{"kinesis sin stream_name", Config{Enabled: true, Sink: "kinesis"}, "events.kinesis.stream_name"},
+		{"kafka not implemented yet", Config{Enabled: true, Sink: "kafka"}, "events.sink kafka Not Implemented Yet"},
+		{"sink desconocido", Config{Enabled: true, Sink: "rabbit"}, "no es válido"},
+		{"buffer negativo", Config{Enabled: true, Sink: "log", Buffer: -1}, "events.buffer"},
+		{"batch_size negativo", Config{Enabled: true, Sink: "log", BatchSize: -1}, "events.batch_size"},
+		{"batch_size sobre el tope", Config{Enabled: true, Sink: "log", BatchSize: 501}, "events.batch_size"},
+		{"flush_interval negativo", Config{Enabled: true, Sink: "log", FlushInterval: -time.Second}, "events.flush_interval"},
+		{"max_retries negativo", Config{Enabled: true, Sink: "log", MaxRetries: -1}, "events.max_retries"},
+		{"retry_backoff negativo", Config{Enabled: true, Sink: "log", RetryBackoff: -time.Millisecond}, "events.retry_backoff"},
 	}
-	if err := (Config{Enabled: true, Sink: "log", Buffer: 8}).Validate(); err != nil {
-		t.Fatal(err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := c.cfg.Validate()
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("no esperaba error, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("err = %v, quiero que contenga %q", err, c.wantErr)
+			}
+		})
 	}
-	if err := (Config{Enabled: true, Sink: "kinesis"}).Validate(); err == nil || !strings.Contains(err.Error(), "paso 19") {
-		t.Fatalf("esperaba rechazo de kinesis, got %v", err)
+}
+
+func TestWithDefaultsFillsBatchSettings(t *testing.T) {
+	c := (Config{}).WithDefaults()
+	if c.Sink != SinkLog || c.Buffer != DefaultBuffer || c.BatchSize != DefaultBatchSize ||
+		c.FlushInterval != DefaultFlushInterval || c.MaxRetries != DefaultMaxRetries || c.RetryBackoff != DefaultRetryBackoff {
+		t.Fatalf("defaults inesperados: %+v", c)
 	}
-	if err := (Config{Enabled: true, Sink: "log", Buffer: -1}).Validate(); err == nil {
-		t.Fatal("buffer negativo debe fallar")
+	c = (Config{BatchSize: 7, FlushInterval: 3 * time.Second}).WithDefaults()
+	if c.BatchSize != 7 || c.FlushInterval != 3*time.Second {
+		t.Fatalf("WithDefaults pisó valores explícitos: %+v", c)
 	}
 }
 

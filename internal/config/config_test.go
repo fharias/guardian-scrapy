@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // base es la configuración mínima válida; cada caso le agrega un bloque ja4.
@@ -56,5 +57,77 @@ func TestLoadJA4Source(t *testing.T) {
 				t.Fatalf("source = %q, want %q", cfg.JA4.Source, c.wantSource)
 			}
 		})
+	}
+}
+
+func TestLoadEvents(t *testing.T) {
+	cases := []struct {
+		name        string
+		extra       string
+		wantEnabled bool
+		wantSink    string
+		wantBuffer  int
+		wantErr     string
+	}{
+		{"sin bloque events: desactivado con defaults", "", false, "log", 1024, ""},
+		{"parcial: enabled sin buffer usa 1024", "events:\n  enabled: true\n  sink: log\n", true, "log", 1024, ""},
+		{"none", "events:\n  enabled: true\n  sink: none\n  buffer: 8\n", true, "none", 8, ""},
+		{"sqs sin queue_url se rechaza", "events:\n  enabled: true\n  sink: sqs\n", false, "", 0, "events.sqs.queue_url"},
+		{"sqs completo", "events:\n  enabled: true\n  sink: sqs\n  sqs:\n    queue_url: \"http://localhost:4566/000000000000/guardian-events\"\n", true, "sqs", 1024, ""},
+		{"kinesis sin stream_name se rechaza", "events:\n  enabled: true\n  sink: kinesis\n", false, "", 0, "events.kinesis.stream_name"},
+		{"kinesis completo", "events:\n  enabled: true\n  sink: kinesis\n  kinesis:\n    stream_name: guardian-events\n", true, "kinesis", 1024, ""},
+		{"kafka not implemented yet	", "events:\n  enabled: true\n  sink: kafka\n", false, "", 0, "events.sink kafka Not Implemented Yet"},
+		{"batch_size fuera de rango", "events:\n  enabled: true\n  sink: log\n  batch_size: 900\n", false, "", 0, "events.batch_size"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "guardian.yml")
+			if err := os.WriteFile(path, []byte(base+c.extra), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want que contenga %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Events.Enabled != c.wantEnabled || cfg.Events.Sink != c.wantSink || cfg.Events.Buffer != c.wantBuffer {
+				t.Fatalf("events = %+v", cfg.Events)
+			}
+		})
+	}
+}
+
+func TestLoadEventsBatchSettings(t *testing.T) {
+	yml := base + "events:\n  enabled: true\n  sink: kinesis\n  batch_size: 25\n  flush_interval: 250ms\n  max_retries: 5\n  retry_backoff: 50ms\n  kinesis:\n    stream_name: guardian-events\n"
+	path := filepath.Join(t.TempDir(), "guardian.yml")
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := cfg.Events
+	if e.BatchSize != 25 || e.FlushInterval != 250*time.Millisecond || e.MaxRetries != 5 ||
+		e.RetryBackoff != 50*time.Millisecond || e.Kinesis.StreamName != "guardian-events" {
+		t.Fatalf("events = %+v", e)
+	}
+
+	// Sin esas claves salen los defaults del paso 20.
+	path2 := filepath.Join(t.TempDir(), "guardian.yml")
+	if err := os.WriteFile(path2, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Events.BatchSize != 100 || cfg.Events.FlushInterval != time.Second || cfg.Events.MaxRetries != 3 {
+		t.Fatalf("defaults = %+v", cfg.Events)
 	}
 }

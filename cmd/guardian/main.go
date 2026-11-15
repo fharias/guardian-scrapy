@@ -311,11 +311,13 @@ func setupEvents(cfg events.Config, logger *slog.Logger, route events.RouteFunc)
 	if err != nil {
 		return noopClose, passthrough, err
 	}
-	dest, err := events.NewSink(cfg, logger)
+	dest, err := events.NewSink(cfg, logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return noopClose, passthrough, err
 	}
 	async := events.NewAsync(dest, cfg, prometheus.DefaultRegisterer)
-	logger.Info("events", "enabled", true, "sink", cfg.WithDefaults().Sink, "buffer", cfg.WithDefaults().Buffer)
+	eff := cfg.WithDefaults()
+	logger.Info("events", "enabled", true, "sink", eff.Sink, "buffer", eff.Buffer,
+		"batch_size", eff.BatchSize, "flush_interval", eff.FlushInterval.String())
 	return async.Close, events.Middleware(async, hasher, route), nil
 }

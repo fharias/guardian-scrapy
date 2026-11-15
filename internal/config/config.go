@@ -113,6 +113,7 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("GUARDIAN_UPSTREAM"); v != "" {
 		cfg.Upstream = v // la variable de entorno gana sobre el YAML
 	}
+	cfg.Events = cfg.Events.WithDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config inválida: %w", err)
 	}

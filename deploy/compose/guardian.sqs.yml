@@ -1,0 +1,61 @@
+listen: ":8080"
+upstream: "http://upstream:9000"
+redis_addr: "valkey:6379"
+app: "shop"
+rate: 1
+burst: 2
+preserve_host: true
+read_header_timeout: 5s
+read_timeout: 20s
+write_timeout: 20s
+idle_timeout: 10s
+shutdown_timeout: 20s
+drain_delay: 5s
+trusted_proxies:
+  - "127.0.0.0/8"
+  - "::1/128"
+x_forwarded_for_header: "X-Forwarded-For"
+scoring:
+  weights:
+    ua_tool: 90
+    headers_incomplete: 30
+    honeypot: 50
+    rate_exceeded: 100
+    low_browser_ratio: 15
+    fake_bot: 90
+    ja4_mismatch: 60
+  browser_ratio_min: 0.3
+  thresholds:
+    challenge: 40
+    block: 85
+rules:
+  honeypots: ["/admin-oculto", "/wp-login.php", "/.env"]
+challenge:
+  difficulty: 16
+  ttl: 2m
+  pass_ttl: 1h
+modes:
+  default: enforce
+  routes:
+    - prefix: /api
+      mode: monitor
+ja4:
+  source: none
+tracing:
+  enabled: true
+  endpoint: "jaeger:4318"
+  insecure: true
+  sample_ratio: 1.0
+  trust_incoming: false
+events:
+  enabled: true
+  sink: sqs
+  buffer: 1024
+  batch_size: 10          # SQS acepta 10 mensajes por llamada: 1 batch = 1 request
+  flush_interval: 1s      # aunque no se llene, el batch sale cada segundo
+  max_retries: 3
+  retry_backoff: 100ms
+  sqs:
+    # Floci devuelve http://floci:4566/000000000000/guardian-events (cuenta falsa 000000000000).
+    # En AWS real sería https://sqs.us-east-1.amazonaws.com/<tu-cuenta>/guardian-events.
+    queue_url: "http://floci:4566/000000000000/guardian-events"

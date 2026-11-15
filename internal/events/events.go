@@ -1,7 +1,7 @@
 // Package events define la interfaz EventSink y el adaptador asíncrono
 // que aísla la latencia del proxy del destino de los eventos.
-// Los adaptadores de SQS, Kinesis y Kafka llegan en los pasos 20 y 22;
-// hoy solo hay un sink de log y el wrapper con buffer.
+// Destinos: log y none (paso 19), SQS y Kinesis con envío por batches (paso 20).
+// El adaptador de Kafka llega en el paso 22.
 package events
 
 import (
@@ -13,17 +13,30 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
-	SinkLog  = "log"
-	SinkNone = "none"
+	SinkLog     = "log"
+	SinkNone    = "none"
+	SinkSQS     = "sqs"
+	SinkKinesis = "kinesis"
+	SinkKafka   = "kafka" // paso 22: hoy se rechaza con un mensaje claro
 
 	// DefaultBuffer cabe ~1 s de holgura a 1.000 req/s. Si el sink
 	// va más lento que el ingreso durante más que eso, empezamos a descartar.
 	DefaultBuffer = 1024
+
+	// Envío por batches (paso 20).
+	DefaultBatchSize     = 100
+	MaxBatchSize         = 500 // tope de PutRecords; SQS lo parte en llamadas de 10
+	DefaultFlushInterval = time.Second
+	DefaultMaxRetries    = 3
+	DefaultRetryBackoff  = 100 * time.Millisecond
 )
 
 // Event es lo que sale del plano de datos hacia el pipeline de señales.
@@ -44,11 +57,31 @@ type Event struct {
 	TraceID     string    `json:"trace_id,omitempty"`
 }
 
+// SQSConfig vive bajo events.sqs. El endpoint NO va aquí: sale de la
+// variable estándar AWS_ENDPOINT_URL (Floci en local, vacío en AWS real).
+type SQSConfig struct {
+	QueueURL string `yaml:"queue_url"`
+}
+
+// KinesisConfig vive bajo events.kinesis.
+type KinesisConfig struct {
+	StreamName string `yaml:"stream_name"`
+}
+
 // Config vive en el YAML, bajo la clave `events`.
 type Config struct {
 	Enabled bool   `yaml:"enabled"`
-	Sink    string `yaml:"sink"`   // log | none (sqs, kinesis, kafka: pasos 20 y 22)
+	Sink    string `yaml:"sink"`   // log | none | sqs | kinesis (kafka: paso 22)
 	Buffer  int    `yaml:"buffer"` // tamaño del canal; default 1024
+
+	// Solo para sqs y kinesis (paso 20). 0 significa "usa el default".
+	BatchSize     int           `yaml:"batch_size"`     // eventos por batch; default 100, máximo 500
+	FlushInterval time.Duration `yaml:"flush_interval"` // vacía un batch incompleto; default 1s
+	MaxRetries    int           `yaml:"max_retries"`    // retries de lo que falló; default 3
+	RetryBackoff  time.Duration `yaml:"retry_backoff"`  // espera base; se duplica; default 100ms
+
+	SQS     SQSConfig     `yaml:"sqs"`
+	Kinesis KinesisConfig `yaml:"kinesis"`
 }
 
 func (c Config) Validate() error {
@@ -62,16 +95,39 @@ func (c Config) Validate() error {
 	}
 	switch sink {
 	case SinkLog, SinkNone:
+	case SinkSQS:
+		u, err := url.Parse(strings.TrimSpace(c.SQS.QueueURL))
+		if c.SQS.QueueURL == "" || err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("events.sqs.queue_url es obligatorio con sink sqs y debe ser una URL completa, ej. https://sqs.us-east-1.amazonaws.com/123456789012/guardian-events (recibido %q)", c.SQS.QueueURL))
+		}
+	case SinkKinesis:
+		if strings.TrimSpace(c.Kinesis.StreamName) == "" {
+			errs = append(errs, errors.New("events.kinesis.stream_name es obligatorio con sink kinesis"))
+		}
+	case SinkKafka:
+		errs = append(errs, errors.New("events.sink kafka Not Implemented Yet"))
 	default:
-		errs = append(errs, fmt.Errorf("events.sink %q no es válido en el paso 19: usa log o none (sqs, kinesis y kafka llegan en los pasos 20 y 22)", c.Sink))
+		errs = append(errs, fmt.Errorf("events.sink %q no es válido: usa log, none, sqs o kinesis", c.Sink))
 	}
 	if c.Buffer < 0 {
 		errs = append(errs, errors.New("events.buffer no puede ser negativo"))
 	}
+	if c.BatchSize < 0 || c.BatchSize > MaxBatchSize {
+		errs = append(errs, fmt.Errorf("events.batch_size debe estar entre 1 y %d (0 usa el default %d)", MaxBatchSize, DefaultBatchSize))
+	}
+	if c.FlushInterval < 0 {
+		errs = append(errs, errors.New("events.flush_interval no puede ser negativo"))
+	}
+	if c.MaxRetries < 0 {
+		errs = append(errs, errors.New("events.max_retries no puede ser negativo"))
+	}
+	if c.RetryBackoff < 0 {
+		errs = append(errs, errors.New("events.retry_backoff no puede ser negativo"))
+	}
 	return errors.Join(errs...)
 }
 
-// WithDefaults rellena sink y buffer si el YAML no los trae.
+// WithDefaults rellena lo que el YAML no trae.
 func (c Config) WithDefaults() Config {
 	if strings.TrimSpace(c.Sink) == "" {
 		c.Sink = SinkLog
@@ -80,11 +136,24 @@ func (c Config) WithDefaults() Config {
 	if c.Buffer == 0 {
 		c.Buffer = DefaultBuffer
 	}
+	if c.BatchSize == 0 {
+		c.BatchSize = DefaultBatchSize
+	}
+	if c.FlushInterval == 0 {
+		c.FlushInterval = DefaultFlushInterval
+	}
+	if c.MaxRetries == 0 {
+		c.MaxRetries = DefaultMaxRetries
+	}
+	if c.RetryBackoff == 0 {
+		c.RetryBackoff = DefaultRetryBackoff
+	}
 	return c
 }
 
 // Sink es el destino. Puede ser lento: el Async lo aísla del request.
-// En el paso 20 SQS y Kinesis implementan esta misma interfaz.
+// SQS y Kinesis (paso 20) implementan BatchSender y el Batcher las
+// convierte en un Sink: el Async no sabe que hay batches.
 type Sink interface {
 	Emit(ctx context.Context, ev Event) error
 	Close(ctx context.Context) error
@@ -165,14 +234,29 @@ func (s *LogSink) Emit(_ context.Context, ev Event) error {
 func (s *LogSink) Close(context.Context) error { return nil }
 
 // NewSink arma el destino según events.sink. El Async lo envuelve después.
-func NewSink(cfg Config, log *slog.Logger) (Sink, error) {
+// reg recibe las métricas del Batcher (solo sqs y kinesis las usan).
+func NewSink(cfg Config, log *slog.Logger, reg prometheus.Registerer) (Sink, error) {
 	cfg = cfg.WithDefaults()
 	switch cfg.Sink {
 	case SinkLog:
 		return NewLogSink(log), nil
 	case SinkNone:
 		return noopDest{}, nil
+	case SinkSQS:
+		client, err := newSQSClient(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		return NewBatcher(NewSQSSender(client, cfg.SQS.QueueURL, cfg.retryPolicy()), cfg, log, reg), nil
+	case SinkKinesis:
+		client, err := newKinesisClient(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		return NewBatcher(NewKinesisSender(client, cfg.Kinesis.StreamName, cfg.retryPolicy()), cfg, log, reg), nil
+	case SinkKafka:
+		return nil, errors.New("events.sink kafka Not Implemented Yet")
 	default:
-		return nil, fmt.Errorf("events.sink %q no es válido en el paso 19: usa log o none", cfg.Sink)
+		return nil, fmt.Errorf("events.sink %q no es válido: usa log, none, sqs o kinesis", cfg.Sink)
 	}
 }
