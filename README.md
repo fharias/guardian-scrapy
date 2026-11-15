@@ -77,7 +77,7 @@ flowchart TD
 | Middleware | `internal/middleware` | Cadena, señales, página de desafío y corte en `block` |
 | Métricas | `internal/metrics` | Contadores, histograma y gauge de la cadena protegida |
 | Trazas | `internal/tracing` | Exporter OTLP/HTTP, muestreo y `Traceparent` hacia el upstream |
-| Eventos | `internal/events` | Veredicto hacia un sink, con la IP en HMAC y un buffer que descarta si se llena |
+| Eventos | `internal/events` | Veredicto hacia log, SQS o Kinesis, con la IP en HMAC y un buffer que descarta si se llena |
 | Veredicto | `internal/verdict` | IP, huella, señales, score, decisión y `trace_id` |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
@@ -296,7 +296,15 @@ El evento sale cuando la cadena protegida ya volvió. `/healthz`, `/readyz` y `P
 export GUARDIAN_EVENT_SALT="$(openssl rand -hex 32)"
 ```
 
-El sink `log` escribe una línea JSON con el mensaje `event`. El sink `none` recorre el mismo buffer y no escribe esa línea. `sqs`, `kinesis` y `kafka` hacen fallar el arranque.
+El sink `log` escribe una línea JSON con el mensaje `event`. El sink `none` recorre el mismo buffer y no escribe esa línea. `kafka` hace fallar el arranque.
+
+`sqs` y `kinesis` acumulan eventos y los vacían al llegar a `batch_size` o al cumplirse `flush_interval`. El valor por defecto es 100 eventos o 1 segundo. El máximo de `batch_size` es 500. `0` vuelve a 100. Cada envío, retries incluidos, tiene un tope de 5 segundos. El cuerpo es el JSON del evento.
+
+SQS parte ese lote en llamadas `SendMessageBatch` de hasta 10 mensajes y 1 MiB. El YAML de Floci usa `batch_size: 10`, así un lote es una sola llamada. Kinesis usa `PutRecords`, hasta 500 registros y 10 MiB. La partition key es el JA4. Si no hay JA4, usa `ip_hash`. Si tampoco hay hash, usa `unknown`. Una key de más de 256 caracteres se recorta.
+
+Un fallo de una entrada se reintenta sola, hasta `max_retries` veces. La espera empieza en `retry_backoff` y se duplica, con tope de 2 segundos y una variación entre la mitad y el total. Los valores por defecto son 3 reintentos y 100 ms. En SQS, un fallo marcado como culpa del mensaje no se reintenta. Lo que sigue fallando suma `guardian_events_send_failures_total`.
+
+La región, el endpoint y las credenciales salen del SDK: `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY`, o un rol. No van en el YAML. Al arrancar, guardian exige región y credenciales, y la lectura de credenciales tiene 5 segundos de tope. Con Floci, `AWS_ENDPOINT_URL` es `http://floci:4566` y las credenciales de prueba son `test` / `test` en `us-east-1`.
 
 `Emit` no espera al destino. Si el canal está lleno, descarta el evento y suma `guardian_events_dropped_total` con el motivo `buffer_full`. Si el sink ya cerró, el motivo es `closed`. Un error del destino, ya con el evento fuera del canal, suma `guardian_events_sink_errors_total`.
 
@@ -314,7 +322,7 @@ cmd/upstream/                 binario de prueba
 internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
-internal/events/              evento del veredicto, HMAC de la IP y buffer
+internal/events/              evento del veredicto, HMAC de la IP, buffer, SQS y Kinesis
 internal/fingerprint/         huella HTTP y política JA4
 internal/ja4source/           origen del JA4: tls, cloudfront o none
 internal/goodbot/             verificación DNS de bots conocidos
@@ -331,6 +339,37 @@ guardian-config.yml           ejemplo para go run, con TLS en :8443
 deploy/compose/               stack local: guardian, upstream, Valkey, Jaeger, Prometheus y Grafana
 Dockerfile                    imagen distroless de guardian o del upstream
 ```
+
+## Herramientas de terceros
+
+Estos servicios no viven dentro del binario. Compose los levanta al lado de guardian, y en AWS real SQS o Kinesis ocupan el lugar de Floci.
+
+![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![Alpine](https://img.shields.io/badge/Alpine-build-0D597F?logo=alpinelinux&logoColor=white)
+![Prometheus](https://img.shields.io/badge/Prometheus-v3.16-E6522C?logo=prometheus&logoColor=white)
+![Grafana](https://img.shields.io/badge/Grafana-13-F46800?logo=grafana&logoColor=white)
+![Jaeger](https://img.shields.io/badge/Jaeger-2.23-66CFE3?logo=jaeger&logoColor=black)
+![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-OTLP-425CC7?logo=opentelemetry&logoColor=white)
+![Distroless](https://img.shields.io/badge/Distroless-runtime-4285F4?logo=googlecloud&logoColor=white)
+![Amazon SQS](https://img.shields.io/badge/Amazon_SQS-eventos-FF9900)
+![Amazon Kinesis](https://img.shields.io/badge/Amazon_Kinesis-eventos-FF9900)
+![Floci](https://img.shields.io/badge/Floci-2.4-111111)
+
+| | Herramienta | Dónde entra |
+| --- | --- | --- |
+| <img src="docs/logos/valkey.svg" width="22" height="24" alt="Valkey"> | Valkey `9.1.3` en Compose y `8` en el `docker run` suelto | Token bucket del límite de tasa, en `redis_addr`. Si no responde, el failover pasa a memoria |
+| ![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?logo=prometheus&logoColor=white) | Prometheus `v3.16.0` | Lee `GET /metrics` de guardian en `:2112` cada 15 segundos y evalúa las alertas |
+| ![Grafana](https://img.shields.io/badge/Grafana-F46800?logo=grafana&logoColor=white) | Grafana `13.0.12` | Dashboard `guardian · overview` en `:3000`, con Prometheus y Jaeger ya provisionados |
+| ![Jaeger](https://img.shields.io/badge/Jaeger-66CFE3?logo=jaeger&logoColor=black) | Jaeger `2.23.0` | UI en `:16686`. Recibe las trazas por OTLP/HTTP en `:4318` |
+| ![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-425CC7?logo=opentelemetry&logoColor=white) | OpenTelemetry | Spans de la cadena protegida y el `Traceparent` que guardian escribe hacia el upstream |
+| ![Amazon SQS](https://img.shields.io/badge/SQS-FF9900) | Amazon SQS | Sink `events.sink: sqs`. Los lotes salen con `SendMessageBatch`, de hasta 10 mensajes |
+| ![Amazon Kinesis](https://img.shields.io/badge/Kinesis-FF9900) | Amazon Kinesis | Sink `events.sink: kinesis`. `PutRecords` usa el JA4 como partition key y, si no hay, `ip_hash` |
+| ![Floci](https://img.shields.io/badge/Floci-111111) | Floci `2.4.0` | AWS local del perfil `aws`, en `127.0.0.1:4566`. Crea la cola y el stream `guardian-events` |
+| ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white) | Docker Compose | Stack de `deploy/compose`: proxy, upstream, Valkey, Jaeger, Prometheus, Grafana y, con el perfil `aws`, Floci |
+| ![Alpine](https://img.shields.io/badge/Alpine-0D597F?logo=alpinelinux&logoColor=white) ![Distroless](https://img.shields.io/badge/Distroless-4285F4?logo=googlecloud&logoColor=white) | Alpine y Distroless | La imagen compila con `golang:1.27.4-alpine` y corre en `gcr.io/distroless/static-debian13:nonroot` |
+
+La región, el endpoint y las credenciales de SQS y Kinesis salen de `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY`. Con Floci el endpoint es `http://floci:4566` y las credenciales de prueba son `test` / `test`.
 
 ## Requisitos
 
@@ -459,8 +498,14 @@ ja4:
 | `tracing.sample_ratio` | no | `0` | Fracción de trazas nuevas, de 0 a 1. El ejemplo usa `1` |
 | `tracing.trust_incoming` | no | `false` | Continúa el `Traceparent` de un peer en `trusted_proxies` |
 | `events.enabled` | no | `false` | Emite un evento por petición de la cadena protegida |
-| `events.sink` | no | `log` | `log` escribe una línea JSON. `none` descarta el destino. Otro valor falla el arranque |
+| `events.sink` | no | `log` | `log`, `none`, `sqs` o `kinesis`. `kafka` y cualquier otro valor fallan el arranque |
 | `events.buffer` | no | `1024` | Capacidad del canal. `0` vuelve a 1024. Un valor negativo falla el arranque |
+| `events.batch_size` | no | `100` | Eventos por lote en SQS y Kinesis. `0` vuelve a 100. Fuera de 1 a 500 falla el arranque |
+| `events.flush_interval` | no | `1s` | Un lote incompleto sale igual al cumplirse este plazo. Un valor negativo falla el arranque |
+| `events.max_retries` | no | `3` | Reintentos de las entradas que fallaron. Un valor negativo falla el arranque |
+| `events.retry_backoff` | no | `100ms` | Espera base del reintento. Se duplica en cada ronda, con tope de 2 s |
+| `events.sqs.queue_url` | con `sqs` | vacío | URL completa `http` o `https` de la cola |
+| `events.kinesis.stream_name` | con `kinesis` | vacío | Nombre del stream |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -476,7 +521,10 @@ La carga también rechaza la configuración cuando:
 - `ja4.source` no es `tls`, `cloudfront` ni `none`, o `cloudfront` se usa sin `trusted_proxies`.
 - una entrada de `ja4.tools` no tiene `name`, el JA4 no tiene la forma `10_12_12` en minúsculas o el mismo JA4 aparece dos veces.
 - `tracing.enabled` es verdadero y falta `tracing.endpoint`, o `tracing.sample_ratio` queda fuera de 0 a 1.
-- `events.enabled` es verdadero y `events.sink` no es `log` ni `none`, o `events.buffer` es negativo.
+- `events.enabled` es verdadero y `events.sink` no es `log`, `none`, `sqs` ni `kinesis`.
+- `events.sink` es `sqs` y `events.sqs.queue_url` no es una URL `http` o `https` con host.
+- `events.sink` es `kinesis` y falta `events.kinesis.stream_name`.
+- `events.buffer`, `events.batch_size`, `events.flush_interval`, `events.max_retries` o `events.retry_backoff` es negativo, o `events.batch_size` pasa de 500.
 - `events.enabled` es verdadero y `GUARDIAN_EVENT_SALT` mide menos de 16 caracteres.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase. `GUARDIAN_EVENT_SALT` es obligatoria solo cuando `events.enabled` es verdadero.
@@ -524,6 +572,11 @@ El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPT
 | `guardian_events_dropped_total` | counter | `reason` | Descartados: `buffer_full` o `closed`. Las dos series existen desde el arranque |
 | `guardian_events_sink_errors_total` | counter | — | Errores del destino al escribir un evento ya sacado del buffer |
 | `guardian_events_buffer_length` | gauge | — | Eventos esperando en el canal |
+| `guardian_events_batches_total` | counter | `sink` | Lotes vaciados hacia SQS o Kinesis |
+| `guardian_events_batch_size` | histogram | `sink` | Eventos por lote. Buckets: 1, 2, 5, 10, 20, 50, 100, 200 y 500 |
+| `guardian_events_retries_total` | counter | `sink` | Rondas que reenviaron solo las entradas fallidas |
+| `guardian_events_send_failures_total` | counter | `sink` | Eventos perdidos después de agotar los reintentos |
+| `guardian_events_api_requests_total` | counter | `sink` | Llamadas `SendMessageBatch` o `PutRecords` |
 
 ## Ejecutar
 
@@ -623,6 +676,7 @@ Los puertos publicados escuchan solo en `127.0.0.1`:
 | Jaeger | `16686` | UI en `http://localhost:16686` |
 | Prometheus | `9090` | UI y API |
 | Grafana | `3000` | UI. El alta de usuarios está cerrada |
+| Floci | `4566` | Solo con el perfil `aws`. Emulador en `127.0.0.1`, sin autenticación real |
 
 `:2112`, el OTLP `:4318`, Valkey `:6379` y el upstream `:9000` se quedan en la red de Compose. Prometheus lee `guardian:2112` cada 15 segundos, evalúa las reglas cada 15 segundos y guarda 7 días en el volumen `prom-data`.
 
@@ -657,7 +711,27 @@ El perfil `demo` pega tres peticiones cada 0,3 segundos: `Mozilla/5.0` a `/api/p
 docker compose --profile demo up --build
 ```
 
-Grafana provisiona Prometheus como datasource por defecto y Jaeger en `http://jaeger:16686`. El dashboard `guardian · overview` (`uid` `guardian-overview`) refresca cada 10 segundos y mira los últimos 30 minutos: requests por ruta, ratio de 5xx, latencia p50/p95/p99, decisiones por tipo, modo y shadow, bloqueos que habrían ocurrido en shadow, las cinco señales más frecuentes, fail-open por motivo, requests en curso y eventos encolados frente a descartados. La UI no puede borrar ni editar ese dashboard.
+Grafana provisiona Prometheus como datasource por defecto y Jaeger en `http://jaeger:16686`. El dashboard `guardian · overview` (`uid` `guardian-overview`) refresca cada 10 segundos y mira los últimos 30 minutos: requests por ruta, ratio de 5xx, latencia p50/p95/p99, decisiones por tipo, modo y shadow, bloqueos que habrían ocurrido en shadow, las cinco señales más frecuentes, fail-open por motivo, requests en curso, eventos encolados frente a descartados, lotes por segundo con su tamaño medio, y reintentos frente a eventos perdidos. La UI no puede borrar ni editar ese dashboard.
+
+### Floci
+
+El perfil `aws` añade Floci `2.4.0` y un init que crea la cola y el stream `guardian-events`. Floci escucha en `127.0.0.1:4566` y dentro de la red en `http://floci:4566`. No monta el socket de Docker: SQS y Kinesis corren dentro del proceso, y el aviso de que Docker no está disponible es el comportamiento esperado. El init usa la imagen `amazon/aws-cli:2.40.3`, la región `us-east-1` y las credenciales `test` / `test`.
+
+`deploy/compose/guardian.yml` sigue con sink `log`. Para mandar los eventos a Floci se superpone `docker-compose.aws.yml`, que monta `guardian.sqs.yml` o, con `GUARDIAN_EVENTS_SINK=kinesis`, `guardian.kinesis.yml`. Esos dos YAML apuntan Valkey a `valkey:6379`, las trazas a `jaeger:4318` y dejan `ja4.source` en `none`. La cola de SQS es `http://floci:4566/000000000000/guardian-events`. El perfil `aws` es obligatorio: `floci` y `aws-init` viven ahí, y guardian espera a que el init termine bien.
+
+```bash
+cd deploy/compose
+docker compose --profile aws -f docker-compose.yml -f docker-compose.aws.yml up -d --build --force-recreate guardian
+GUARDIAN_EVENTS_SINK=kinesis docker compose --profile aws -f docker-compose.yml -f docker-compose.aws.yml up -d --force-recreate guardian
+```
+
+Para mirar la cola y el stream sin instalar el AWS CLI, esta función corre el CLI dentro de la red de Compose. Vale solo para esa sesión de terminal:
+
+```bash
+awsl() { docker compose --profile aws run --rm -T --no-deps --entrypoint aws aws-init --endpoint-url http://floci:4566 "$@"; }
+awsl sqs list-queues
+awsl kinesis list-streams
+```
 
 `deploy/compose/prometheus/alerts.yml` define cuatro alertas del job `guardian`:
 
