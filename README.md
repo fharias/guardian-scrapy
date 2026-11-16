@@ -57,12 +57,14 @@ La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del re
 ```mermaid
 flowchart TD
   init[Init] --> mets[Metrics] --> events[Events] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA]
-  ua --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+  ua --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rep[Reputation] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
 | --- | --- | --- |
 | Proxy y servidores | `cmd/guardian` | YAML, HTTP, HTTPS, PROXY protocol, métricas, trazas, Valkey y apagado |
+| Agregador | `cmd/aggregator` | Lee la cola SQS, cuenta IPs distintas por JA4 y marca la reputación en Valkey |
+| Reputación | `internal/reputation` | HyperLogLog por JA4 y la marca que el proxy consulta |
 | ClientHello | `internal/tlshello` | Foto del saludo TLS, JA4 y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
 | Configuración | `internal/config` | Carga y validación del YAML |
@@ -187,6 +189,7 @@ Con el YAML de ejemplo los pesos y los umbrales son estos:
 | Ruta en `rules.honeypots` | 50 | `honeypot` | `challenge` |
 | Límite de tasa superado | 100 | `rate_limit` | `block` |
 | User-Agent de navegador con un JA4 de `ja4.tools` | 60 | `ja4_incoherente` | `challenge` |
+| JA4 marcado con mala reputación | 0 en `guardian-config.yml`; 50 en `guardian.sqs.yml` | `ja4_reputacion` | `allow` con peso 0. Con 50 puntos, `challenge` |
 | Ratio de navegador por debajo de `browser_ratio_min` | 15 | `ratio_navegador_bajo` | `allow` |
 
 `ip_denegada` y `ruta_privada` no suman un peso: el score queda en el umbral de `block` y la decisión es `block`, también si el bot estaba verificado. Un bot verificado, sin esas denegaciones, queda en `allow` con score 0 aunque haya visitado un honeypot.
@@ -276,6 +279,7 @@ flowchart TD
   root --> c[mw.fingerprint]
   root --> d[mw.ja4]
   root --> e[mw.ja4mismatch]
+  root --> r[mw.reputation]
   root --> f[mw.rules]
   root --> g[mw.ratelimit]
   root --> h[mw.score]
@@ -308,6 +312,18 @@ La región, el endpoint y las credenciales salen del SDK: `AWS_REGION`, `AWS_END
 
 `Emit` no espera al destino. Si el canal está lleno, descarta el evento y suma `guardian_events_dropped_total` con el motivo `buffer_full`. Si el sink ya cerró, el motivo es `closed`. Un error del destino, ya con el evento fuera del canal, suma `guardian_events_sink_errors_total`.
 
+### Reputación de JA4
+
+`reputation.enabled` en falso no consulta Valkey y el aggregator se niega a arrancar. El `guardian-config.yml` de la raíz lo deja apagado. `deploy/compose/guardian.sqs.yml` lo enciende, con peso `ja4_reputation` 50. Si está encendido y ese peso es 0, la carga del YAML falla: la señal se calcularía y no sumaría.
+
+El aggregator, `cmd/aggregator`, lee la misma cola SQS que guardian escribe. Kinesis todavía no lo consume. Hace long poll de 20 segundos, de hasta 10 mensajes, con visibility timeout de 30 segundos. Aplica el lote en Valkey y solo entonces borra los mensajes. Si Valkey falla, los mensajes vuelven cuando vence esa visibilidad. `Apply` es idempotente: un `ip_hash` repetido no infla el conteo. Un JSON que no decodifica se borra igual, para que no vuelva en cada ciclo.
+
+Cada evento con JA4 e `ip_hash` entra en un HyperLogLog `gd:<app>:ja4ips:{<ja4>}:<bucket>`. El bucket es el de `ev.Time`, alineado a `reputation.bucket`. La llave vive `window` más un bucket. El `{ja4}` es un hash tag: en un cluster, los buckets de un mismo JA4 caen en el mismo slot y `PFCOUNT` puede unirlos. La ventana por defecto es 1 hora en buckets de 10 minutos, seis llaves. La ventana tiene que ser múltiplo del bucket y el cociente no puede pasar de 24.
+
+Si las IPs distintas de la ventana llegan a `min_distinct_ips` (50 por defecto), el aggregator escribe `gd:<app>:ja4rep:{<ja4>}` con ese conteo y TTL `ttl` (30 minutos). El log deja una línea `ja4_marcado`.
+
+En la cadena protegida, `Reputation` va después de `JA4Mismatch`. Si el veredicto trae JA4, hace un `GET` de esa marca con tope `lookup_timeout` (20 ms). Un valor presente marca `JA4Reputation` y el scorer suma `ja4_reputacion`. Una clave ausente deja la señal en falso. Un error de Valkey también la deja en falso, escribe `reputation no disponible` y no guarda esa respuesta: el siguiente request vuelve a preguntar. Las respuestas buenas y las ausencias se cachean `cache_ttl` (10 segundos), hasta 10 000 JA4; al pasar de ese tope la caché se vacía. `POST /__guardian/verify` no consulta la reputación.
+
 ### HTTPS y ClientHello
 
 El bloque `tls` enciende el listener cuando trae `listen`, `cert_file` o `key_file`. Si aparece uno, los tres son obligatorios. El proceso sale al arrancar si el certificado o la clave no se pueden leer.
@@ -318,6 +334,7 @@ Cada conexión HTTPS deja una sola línea `tls_hello`: `sni`, versión y cipher 
 
 ```
 cmd/guardian/                 binario del proxy
+cmd/aggregator/               consume SQS y marca JA4 en Valkey
 cmd/upstream/                 binario de prueba
 internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
@@ -331,6 +348,7 @@ internal/middleware/          cadena, señales, desafío, modo y spans
 internal/tracing/             OTLP/HTTP, muestreo y Traceparent hacia el upstream
 internal/policy/              monitor o enforce por prefijo; label route
 internal/ratelimit/           Valkey, memoria y failover
+internal/reputation/          HyperLogLog por JA4 y la marca que lee el proxy
 internal/rules/               honeypots, denegaciones y rutas
 internal/scoring/             pesos, umbrales y decisión
 internal/tlshello/            ClientHello y cálculo del JA4
@@ -506,6 +524,14 @@ ja4:
 | `events.retry_backoff` | no | `100ms` | Espera base del reintento. Se duplica en cada ronda, con tope de 2 s |
 | `events.sqs.queue_url` | con `sqs` | vacío | URL completa `http` o `https` de la cola |
 | `events.kinesis.stream_name` | con `kinesis` | vacío | Nombre del stream |
+| `scoring.weights.ja4_reputation` | no | 0 | Puntos si el JA4 está marcado. Con `reputation.enabled`, tiene que ser mayor que 0 |
+| `reputation.enabled` | no | `false` | El proxy consulta la marca y el aggregator exige que esté en verdadero |
+| `reputation.window` | no | `1h` | Ventana de IPs distintas. Múltiplo de `bucket`, y el cociente no pasa de 24 |
+| `reputation.bucket` | no | `10m` | Tamaño de cada HyperLogLog |
+| `reputation.min_distinct_ips` | no | `50` | IPs distintas para marcar el JA4. Mínimo 2 |
+| `reputation.ttl` | no | `30m` | Vida de la marca. Tiene que ser mayor que 0 |
+| `reputation.cache_ttl` | no | `10s` | Caché local del proxy. `0` o ausente vuelve a `10s` |
+| `reputation.lookup_timeout` | no | `20ms` | Tope del `GET` en el proxy |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -525,6 +551,7 @@ La carga también rechaza la configuración cuando:
 - `events.sink` es `sqs` y `events.sqs.queue_url` no es una URL `http` o `https` con host.
 - `events.sink` es `kinesis` y falta `events.kinesis.stream_name`.
 - `events.buffer`, `events.batch_size`, `events.flush_interval`, `events.max_retries` o `events.retry_backoff` es negativo, o `events.batch_size` pasa de 500.
+- `reputation.enabled` es verdadero y `scoring.weights.ja4_reputation` es 0, la ventana no es múltiplo del bucket, el cociente pasa de 24, `min_distinct_ips` es menor que 2, o `ttl` y `lookup_timeout` no son mayores que 0.
 - `events.enabled` es verdadero y `GUARDIAN_EVENT_SALT` mide menos de 16 caracteres.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase. `GUARDIAN_EVENT_SALT` es obligatoria solo cuando `events.enabled` es verdadero.
@@ -717,7 +744,9 @@ Grafana provisiona Prometheus como datasource por defecto y Jaeger en `http://ja
 
 El perfil `aws` añade Floci `2.4.0` y un init que crea la cola y el stream `guardian-events`. Floci escucha en `127.0.0.1:4566` y dentro de la red en `http://floci:4566`. No monta el socket de Docker: SQS y Kinesis corren dentro del proceso, y el aviso de que Docker no está disponible es el comportamiento esperado. El init usa la imagen `amazon/aws-cli:2.40.3`, la región `us-east-1` y las credenciales `test` / `test`.
 
-`deploy/compose/guardian.yml` sigue con sink `log`. Para mandar los eventos a Floci se superpone `docker-compose.aws.yml`, que monta `guardian.sqs.yml` o, con `GUARDIAN_EVENTS_SINK=kinesis`, `guardian.kinesis.yml`. Esos dos YAML apuntan Valkey a `valkey:6379`, las trazas a `jaeger:4318` y dejan `ja4.source` en `none`. La cola de SQS es `http://floci:4566/000000000000/guardian-events`. El perfil `aws` es obligatorio: `floci` y `aws-init` viven ahí, y guardian espera a que el init termine bien.
+`deploy/compose/guardian.yml` sigue con sink `log`. Para mandar los eventos a Floci se superpone `docker-compose.aws.yml`, que monta `guardian.sqs.yml` o, con `GUARDIAN_EVENTS_SINK=kinesis`, `guardian.kinesis.yml`. Los dos apuntan Valkey a `valkey:6379` y las trazas a `jaeger:4318`. `guardian.sqs.yml` deja `ja4.source` en `cloudfront` y enciende `reputation`. `guardian.kinesis.yml` deja `ja4.source` en `none`. La cola de SQS es `http://floci:4566/000000000000/guardian-events`. El perfil `aws` es obligatorio: `floci` y `aws-init` viven ahí, y guardian espera a que el init termine bien.
+
+El mismo override levanta `cmd/aggregator`. Siempre monta `guardian.sqs.yml`, espera a Valkey sano y al init, y no publica puertos. Corre en solo lectura, sin capabilities y con `no-new-privileges`. Con `GUARDIAN_EVENTS_SINK=kinesis`, guardian escribe en el stream y el aggregator sigue leyendo la cola SQS.
 
 ```bash
 cd deploy/compose
