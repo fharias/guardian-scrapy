@@ -14,6 +14,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/ja4source"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/fharias/guardian-scrapy/internal/reputation"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/tlshello"
@@ -223,6 +224,24 @@ func Rules(e *rules.Engine, bots *goodbot.Verifier, dnsTimeout time.Duration) Mi
 			v.Signals.VerifiedBot = verified
 			v.Signals.FakeBot = claimed && !verified
 
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func Reputation(rep *reputation.Reader, log *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		if rep == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil && v.JA4 != "" {
+				bad, _, err := rep.Bad(r.Context(), v.JA4)
+				if err != nil {
+					log.Warn("reputation no disponible", "err", err)
+				}
+				v.Signals.JA4Reputation = bad
+			}
 			next.ServeHTTP(w, r)
 		})
 	}

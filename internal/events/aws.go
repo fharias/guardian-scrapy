@@ -48,3 +48,7 @@ func newKinesisClient(ctx context.Context) (*kinesis.Client, error) {
 	}
 	return kinesis.NewFromConfig(cfg), nil
 }
+
+func NewSQSClient(ctx context.Context) (*sqs.Client, error) {
+	return newSQSClient(ctx)
+}

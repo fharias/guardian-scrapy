@@ -33,6 +33,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/middleware"
 	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
+	"github.com/fharias/guardian-scrapy/internal/reputation"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/tlshello"
@@ -157,6 +158,12 @@ func main() {
 		logger.Error("ja4source", "err", err)
 		os.Exit(1)
 	}
+	var repReader *reputation.Reader
+	if cfg.Reputation.Enabled {
+		repReader = reputation.NewReader(rdb, cfg.App, cfg.Reputation)
+	}
+	logger.Info("reputation", "enabled", cfg.Reputation.Enabled,
+		"min_distinct_ips", cfg.Reputation.MinDistinctIPs, "cache_ttl", cfg.Reputation.CacheTTL.String())
 	tracer := otel.Tracer("github.com/fharias/guardian-scrapy")
 	step := func(name string, mw middleware.Middleware) middleware.Middleware {
 		return middleware.Traced(tracer, name, mw)
@@ -176,7 +183,9 @@ func main() {
 		step("suspiciousua", middleware.SuspiciousUA()),
 		step("fingerprint", middleware.Fingerprint()),
 		step("ja4", middleware.JA4(ja4Source, logger)),
+
 		step("ja4mismatch", middleware.JA4Mismatch(ja4Policy)),
+		step("reputation", middleware.Reputation(repReader, logger)),
 		step("rules", middleware.Rules(engine, bots, 300*time.Millisecond)),
 		step("ratelimit", middleware.RateLimit(store, logger)),
 		step("score", middleware.Score(scorer)),

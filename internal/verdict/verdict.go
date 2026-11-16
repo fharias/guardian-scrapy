@@ -35,6 +35,7 @@ type Signals struct {
 	FakeBot           bool
 	VerifiedBot       bool
 	JA4Mismatch       bool
+	JA4Reputation     bool
 }
 
 type Verdict struct {

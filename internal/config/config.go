@@ -13,6 +13,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/policy"
+	"github.com/fharias/guardian-scrapy/internal/reputation"
 	"github.com/fharias/guardian-scrapy/internal/rules"
 	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/tracing"
@@ -53,6 +54,7 @@ type Config struct {
 	JA4                 fingerprint.JA4Config `yaml:"ja4"`
 	Tracing             tracing.Config        `yaml:"tracing"`
 	Events              events.Config         `yaml:"events"`
+	Reputation          reputation.Config     `yaml:"reputation"`
 	UpstreamURL         *url.URL              `yaml:"-"`
 }
 
@@ -114,6 +116,7 @@ func Load(path string) (*Config, error) {
 		cfg.Upstream = v // la variable de entorno gana sobre el YAML
 	}
 	cfg.Events = cfg.Events.WithDefaults()
+	cfg.Reputation = cfg.Reputation.WithDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config inválida: %w", err)
 	}
@@ -184,6 +187,12 @@ func (c *Config) validate() error {
 	}
 	if err := c.Events.Validate(); err != nil {
 		errs = append(errs, err)
+	}
+	if err := c.Reputation.Validate(); err != nil {
+		errs = append(errs, err)
+	}
+	if c.Reputation.Enabled && c.Scoring.Weights.JA4Reputation <= 0 {
+		errs = append(errs, errors.New("reputation.enabled es true pero scoring.weights.ja4_reputation es 0: la señal se calcularía y nunca sumaría"))
 	}
 	return errors.Join(errs...)
 }

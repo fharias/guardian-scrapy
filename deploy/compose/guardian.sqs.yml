@@ -14,6 +14,8 @@ drain_delay: 5s
 trusted_proxies:
   - "127.0.0.0/8"
   - "::1/128"
+  - "172.16.0.0/12"
+  - "192.168.65.0/24"
 x_forwarded_for_header: "X-Forwarded-For"
 scoring:
   weights:
@@ -24,6 +26,7 @@ scoring:
     low_browser_ratio: 15
     fake_bot: 90
     ja4_mismatch: 60
+    ja4_reputation: 50 
   browser_ratio_min: 0.3
   thresholds:
     challenge: 40
@@ -40,7 +43,7 @@ modes:
     - prefix: /api
       mode: monitor
 ja4:
-  source: none
+  source: cloudfront
 tracing:
   enabled: true
   endpoint: "jaeger:4318"
@@ -59,3 +62,11 @@ events:
     # Floci devuelve http://floci:4566/000000000000/guardian-events (cuenta falsa 000000000000).
     # En AWS real sería https://sqs.us-east-1.amazonaws.com/<tu-cuenta>/guardian-events.
     queue_url: "http://floci:4566/000000000000/guardian-events"
+reputation:
+  enabled: true
+  window: 1h               # IPs distintas en la última hora...
+  bucket: 10m              # ...en 6 HLL de 10 minutos
+  min_distinct_ips: 50     # 50 IPs distintas con el mismo JA4 = sospechoso
+  ttl: 30m                 # la marca se borra sola si deja de cumplirse
+  cache_ttl: 10s           # caché local de guardian
+  lookup_timeout: 20ms
