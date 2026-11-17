@@ -34,7 +34,7 @@ func (r *SendResult) add(o SendResult) {
 	r.Requests += o.Requests
 }
 
-// BatchSender es el contrato que cumplen los adaptadores de SQS y Kinesis.
+// BatchSender es el contrato que cumplen los adaptadores de SQS, Kinesis y Kafka.
 // Send recibe un batch ya armado, lo parte según los límites de la API
 // y hace retry SOLO de lo que falló. Devuelve error si algún evento se perdió.
 type BatchSender interface {
@@ -192,7 +192,7 @@ func newBatcherMetrics(reg prometheus.Registerer, sink string) batcherMetrics {
 		}, []string{"sink"}),
 		requests: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "guardian_events_api_requests_total",
-			Help: "Llamadas a la API del destino (SendMessageBatch o PutRecords). SQS cobra por esto.",
+			Help: "Llamadas a la API del destino (SendMessageBatch, PutRecords o Produce requests de Kafka). SQS cobra por esto.",
 		}, []string{"sink"}),
 	}
 	// Las series existen desde el arranque, en cero.

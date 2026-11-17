@@ -1,0 +1,74 @@
+# Override que apunta guardian y el aggregator a un Kafka local (KRaft, un broker).
+# Es el reemplazo local de Amazon MSK: mismo protocolo, sin TLS ni IAM.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.kafka.yml up -d --build
+#
+# NO necesita --profile aws: aquí no hay Floci. Los servicios de este archivo
+# solo existen cuando lo pasas con -f.
+services:
+  kafka:
+    image: apache/kafka:4.4.0
+    environment:
+      # KRaft: el mismo proceso es broker y controller (sin ZooKeeper).
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # PLAINTEXT: para los contenedores (kafka:9092). HOST: para tu laptop (localhost:9094).
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Un solo broker: los topics internos no pueden tener 3 réplicas.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # El topic lo crea kafka-init con 6 partitions; un typo en el YAML no crea topics fantasma.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "127.0.0.1:9094:9094"   # solo tu laptop: este Kafka no tiene autenticación
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  kafka-init:         # crea el topic; corre una vez y termina
+    image: apache/kafka:4.4.0
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        T=/opt/kafka/bin/kafka-topics.sh
+        $$T --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic guardian-events --partitions 6 --replication-factor 1 \
+          --config retention.ms=86400000
+        $$T --bootstrap-server kafka:9092 --describe --topic guardian-events
+        echo "listo: topic guardian-events"
+    depends_on:
+      kafka: { condition: service_healthy }
+    restart: "no"
+
+  guardian:
+    volumes:
+      # Mismo destino que en docker-compose.yml: reemplaza al guardian.yml normal.
+      - ./guardian.kafka.yml:/etc/guardian/guardian.yml:ro
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+
+  aggregator:
+    build:
+      context: ../..
+      args: { CMD: aggregator, VERSION: dev }
+    image: guardian-aggregator:dev
+    command: ["-config", "/etc/guardian/guardian.yml"]
+    volumes:
+      - ./guardian.kafka.yml:/etc/guardian/guardian.yml:ro
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      valkey: { condition: service_healthy }
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]

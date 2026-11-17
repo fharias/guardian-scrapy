@@ -1,0 +1,80 @@
+listen: ":8080"
+upstream: "http://upstream:9000"
+redis_addr: "valkey:6379"
+app: "shop"
+rate: 1
+burst: 2
+preserve_host: true
+read_header_timeout: 5s
+read_timeout: 20s
+write_timeout: 20s
+idle_timeout: 10s
+shutdown_timeout: 20s
+drain_delay: 5s
+trusted_proxies:
+  - "127.0.0.0/8"
+  - "::1/128"
+  - "172.16.0.0/12"
+  - "192.168.65.0/24"
+x_forwarded_for_header: "X-Forwarded-For"
+scoring:
+  weights:
+    ua_tool: 90
+    headers_incomplete: 30
+    honeypot: 50
+    rate_exceeded: 100
+    low_browser_ratio: 15
+    fake_bot: 90
+    ja4_mismatch: 60
+    ja4_reputation: 50 
+  browser_ratio_min: 0.3
+  thresholds:
+    challenge: 40
+    block: 85
+rules:
+  honeypots: ["/admin-oculto", "/wp-login.php", "/.env"]
+challenge:
+  difficulty: 16
+  ttl: 2m
+  pass_ttl: 1h
+modes:
+  default: enforce
+  routes:
+    - prefix: /api
+      mode: monitor
+ja4:
+  source: cloudfront
+tracing:
+  enabled: true
+  endpoint: "jaeger:4318"
+  insecure: true
+  sample_ratio: 1.0
+  trust_incoming: false
+events:
+  enabled: true
+  sink: kafka               # lo ÚNICO que cambia respecto a guardian.sqs.yml es este bloque
+  buffer: 1024
+  batch_size: 100           # el Batcher arma lotes de 100; franz-go los reparte por partition
+  flush_interval: 1s
+  kafka:
+    brokers: ["kafka:9092"] # en MSK: los bootstrap brokers (puerto 9098 con IAM)
+    topic: guardian-events  # lo crea kafka-init con 6 partitions
+    client_id: guardian
+    key: ip_hash            # ip_hash | ja4 | none (ver la lección: hot partitions)
+    compression: zstd
+    linger: 5ms
+    delivery_timeout: 4s
+    consumer_group: guardian-aggregator
+    # Enterprise (MSK con IAM):
+    # tls:
+    #   enabled: true
+    # sasl:
+    #   mechanism: aws_msk_iam
+reputation:
+  enabled: true
+  window: 1h               # IPs distintas en la última hora...
+  bucket: 10m              # ...en 6 HLL de 10 minutos
+  min_distinct_ips: 50     # 50 IPs distintas con el mismo JA4 = sospechoso
+  ttl: 30m                 # la marca se borra sola si deja de cumplirse
+  cache_ttl: 10s           # caché local de guardian
+  lookup_timeout: 20ms

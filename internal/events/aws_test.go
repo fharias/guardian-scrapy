@@ -63,10 +63,3 @@ func TestNewSinkFailsFastWithoutRegionOrCredentials(t *testing.T) {
 		t.Fatalf("sin credenciales: err = %v, quiero que mencione credenciales", err)
 	}
 }
-
-func TestNewSinkRejectsKafkaUntilStep22(t *testing.T) {
-	_, err := NewSink(Config{Sink: "kafka"}, nil, prometheus.NewRegistry())
-	if err == nil || !strings.Contains(err.Error(), "events.sink kafka Not Implemented Yet") {
-		t.Fatalf("err = %v", err)
-	}
-}

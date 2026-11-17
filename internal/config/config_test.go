@@ -76,7 +76,8 @@ func TestLoadEvents(t *testing.T) {
 		{"sqs completo", "events:\n  enabled: true\n  sink: sqs\n  sqs:\n    queue_url: \"http://localhost:4566/000000000000/guardian-events\"\n", true, "sqs", 1024, ""},
 		{"kinesis sin stream_name se rechaza", "events:\n  enabled: true\n  sink: kinesis\n", false, "", 0, "events.kinesis.stream_name"},
 		{"kinesis completo", "events:\n  enabled: true\n  sink: kinesis\n  kinesis:\n    stream_name: guardian-events\n", true, "kinesis", 1024, ""},
-		{"kafka not implemented yet	", "events:\n  enabled: true\n  sink: kafka\n", false, "", 0, "events.sink kafka Not Implemented Yet"},
+		{"kafka sin brokers se rechaza", "events:\n  enabled: true\n  sink: kafka\n  kafka:\n    topic: guardian-events\n", false, "", 0, "events.kafka.brokers"},
+		{"kafka completo", "events:\n  enabled: true\n  sink: kafka\n  kafka:\n    brokers: [\"kafka:9092\"]\n    topic: guardian-events\n", true, "kafka", 1024, ""},
 		{"batch_size fuera de rango", "events:\n  enabled: true\n  sink: log\n  batch_size: 900\n", false, "", 0, "events.batch_size"},
 	}
 	for _, c := range cases {
@@ -129,5 +130,49 @@ func TestLoadEventsBatchSettings(t *testing.T) {
 	}
 	if cfg.Events.BatchSize != 100 || cfg.Events.FlushInterval != time.Second || cfg.Events.MaxRetries != 3 {
 		t.Fatalf("defaults = %+v", cfg.Events)
+	}
+}
+
+func TestLoadEventsKafka(t *testing.T) {
+	yml := base + `events:
+  enabled: true
+  sink: kafka
+  batch_size: 200
+  kafka:
+    brokers: ["b-1.guardian.abc123.c2.kafka.us-east-1.amazonaws.com:9098", "b-2.guardian.abc123.c2.kafka.us-east-1.amazonaws.com:9098"]
+    topic: guardian-events
+    client_id: guardian-prod
+    key: ja4
+    compression: lz4
+    linger: 20ms
+    delivery_timeout: 3s
+    consumer_group: aggregator-prod
+    tls:
+      enabled: true
+    sasl:
+      mechanism: aws_msk_iam
+`
+	path := filepath.Join(t.TempDir(), "guardian.yml")
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := cfg.Events.Kafka
+	if len(k.Brokers) != 2 || k.Topic != "guardian-events" || k.ClientID != "guardian-prod" || k.Key != "ja4" ||
+		k.Compression != "lz4" || k.Linger != 20*time.Millisecond || k.DeliveryTimeout != 3*time.Second ||
+		k.ConsumerGroup != "aggregator-prod" || !k.TLS.Enabled || k.SASL.Mechanism != "aws_msk_iam" || cfg.Events.BatchSize != 200 {
+		t.Fatalf("kafka = %+v", k)
+	}
+
+	// Una clave mal escrita (KnownFields) se rechaza en vez de ignorarse.
+	bad := filepath.Join(t.TempDir(), "guardian.yml")
+	if err := os.WriteFile(bad, []byte(base+"events:\n  enabled: true\n  sink: kafka\n  kafka:\n    broker: [\"kafka:9092\"]\n    topic: t\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "broker") {
+		t.Fatalf("err = %v, quiero que mencione la clave desconocida broker", err)
 	}
 }

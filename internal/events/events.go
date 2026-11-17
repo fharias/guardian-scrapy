@@ -1,7 +1,7 @@
 // Package events define la interfaz EventSink y el adaptador asíncrono
 // que aísla la latencia del proxy del destino de los eventos.
-// Destinos: log y none (paso 19), SQS y Kinesis con envío por batches (paso 20).
-// El adaptador de Kafka llega en el paso 22.
+// Destinos: log y none (paso 19), SQS y Kinesis con envío por batches (paso 20)
+// y Kafka/MSK (paso 22), los tres detrás del mismo Batcher.
 package events
 
 import (
@@ -25,7 +25,7 @@ const (
 	SinkNone    = "none"
 	SinkSQS     = "sqs"
 	SinkKinesis = "kinesis"
-	SinkKafka   = "kafka" // paso 22: hoy se rechaza con un mensaje claro
+	SinkKafka   = "kafka" // paso 22: Kafka local o Amazon MSK (kafka.go)
 
 	// DefaultBuffer cabe ~1 s de holgura a 1.000 req/s. Si el sink
 	// va más lento que el ingreso durante más que eso, empezamos a descartar.
@@ -71,10 +71,11 @@ type KinesisConfig struct {
 // Config vive en el YAML, bajo la clave `events`.
 type Config struct {
 	Enabled bool   `yaml:"enabled"`
-	Sink    string `yaml:"sink"`   // log | none | sqs | kinesis (kafka: paso 22)
+	Sink    string `yaml:"sink"`   // log | none | sqs | kinesis | kafka
 	Buffer  int    `yaml:"buffer"` // tamaño del canal; default 1024
 
-	// Solo para sqs y kinesis (paso 20). 0 significa "usa el default".
+	// Solo para sqs, kinesis y kafka. 0 significa "usa el default".
+	// En kafka, max_retries no aplica: franz-go reintenta hasta kafka.delivery_timeout.
 	BatchSize     int           `yaml:"batch_size"`     // eventos por batch; default 100, máximo 500
 	FlushInterval time.Duration `yaml:"flush_interval"` // vacía un batch incompleto; default 1s
 	MaxRetries    int           `yaml:"max_retries"`    // retries de lo que falló; default 3
@@ -82,6 +83,7 @@ type Config struct {
 
 	SQS     SQSConfig     `yaml:"sqs"`
 	Kinesis KinesisConfig `yaml:"kinesis"`
+	Kafka   KafkaConfig   `yaml:"kafka"` // paso 22
 }
 
 func (c Config) Validate() error {
@@ -105,9 +107,11 @@ func (c Config) Validate() error {
 			errs = append(errs, errors.New("events.kinesis.stream_name es obligatorio con sink kinesis"))
 		}
 	case SinkKafka:
-		errs = append(errs, errors.New("events.sink kafka Not Implemented Yet"))
+		if err := c.Kafka.Validate(); err != nil {
+			errs = append(errs, err)
+		}
 	default:
-		errs = append(errs, fmt.Errorf("events.sink %q no es válido: usa log, none, sqs o kinesis", c.Sink))
+		errs = append(errs, fmt.Errorf("events.sink %q no es válido: usa log, none, sqs, kinesis o kafka", c.Sink))
 	}
 	if c.Buffer < 0 {
 		errs = append(errs, errors.New("events.buffer no puede ser negativo"))
@@ -148,6 +152,7 @@ func (c Config) WithDefaults() Config {
 	if c.RetryBackoff == 0 {
 		c.RetryBackoff = DefaultRetryBackoff
 	}
+	c.Kafka = c.Kafka.WithDefaults()
 	return c
 }
 
@@ -234,7 +239,7 @@ func (s *LogSink) Emit(_ context.Context, ev Event) error {
 func (s *LogSink) Close(context.Context) error { return nil }
 
 // NewSink arma el destino según events.sink. El Async lo envuelve después.
-// reg recibe las métricas del Batcher (solo sqs y kinesis las usan).
+// reg recibe las métricas del Batcher (sqs, kinesis y kafka las usan).
 func NewSink(cfg Config, log *slog.Logger, reg prometheus.Registerer) (Sink, error) {
 	cfg = cfg.WithDefaults()
 	switch cfg.Sink {
@@ -255,8 +260,23 @@ func NewSink(cfg Config, log *slog.Logger, reg prometheus.Registerer) (Sink, err
 		}
 		return NewBatcher(NewKinesisSender(client, cfg.Kinesis.StreamName, cfg.retryPolicy()), cfg, log, reg), nil
 	case SinkKafka:
-		return nil, errors.New("events.sink kafka Not Implemented Yet")
+		sender, err := NewKafkaSender(context.Background(), cfg.Kafka, cfg.retryPolicy())
+		if err != nil {
+			return nil, err
+		}
+		if log == nil {
+			log = slog.Default()
+		}
+		// Avisa si Kafka no responde, pero NO impide arrancar: perder eventos un
+		// rato es mejor que tumbar el proxy. franz-go reconecta solo.
+		pctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := sender.Ping(pctx); err != nil {
+			log.Warn("events: kafka no responde al arrancar; franz-go seguirá intentando",
+				"brokers", cfg.Kafka.Brokers, "err", err)
+		}
+		cancel()
+		return NewBatcher(sender, cfg, log, reg), nil
 	default:
-		return nil, fmt.Errorf("events.sink %q no es válido: usa log, none, sqs o kinesis", cfg.Sink)
+		return nil, fmt.Errorf("events.sink %q no es válido: usa log, none, sqs, kinesis o kafka", cfg.Sink)
 	}
 }

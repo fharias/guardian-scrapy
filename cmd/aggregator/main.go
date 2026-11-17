@@ -1,10 +1,11 @@
-// Command aggregator consume los eventos de guardian desde SQS (paso 21),
+// Command aggregator consume los eventos de guardian desde SQS (paso 21) o
+// desde Kafka/MSK (paso 22, kafka.go), según events.sink del mismo YAML,
 // cuenta IPs distintas por JA4 con HyperLogLog en Valkey y marca con TTL
 // los JA4 que aparecen en demasiadas IPs. guardian lee esa marca en el scorer.
 //
-// Semántica: at-least-once. Un mensaje se borra de SQS SOLO después de
-// aplicarlo en Valkey. Si el proceso muere en medio, SQS lo reentrega
-// cuando vence el visibility timeout, y como Apply es idempotente, no pasa nada.
+// Semántica: at-least-once. Un mensaje se borra de SQS (o su offset se
+// commitea en Kafka) SOLO después de aplicarlo en Valkey. Si el proceso muere
+// en medio, se reentrega, y como Apply es idempotente, no pasa nada.
 package main
 
 import (
@@ -55,19 +56,14 @@ func main() {
 		log.Error("reputation.enabled es false: el aggregator no tiene nada que hacer")
 		os.Exit(1)
 	}
-	if cfg.Events.Sink != events.SinkSQS {
-		log.Error("el aggregator solo consume de SQS por ahora (Kinesis: Not Implemented Yet)", "sink", cfg.Events.Sink)
+	if cfg.Events.Sink != events.SinkSQS && cfg.Events.Sink != events.SinkKafka {
+		log.Error("el aggregator consume de SQS o Kafka (Kinesis: Not Implemented Yet)", "sink", cfg.Events.Sink)
 		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	client, err := events.NewSQSClient(ctx)
-	if err != nil {
-		log.Error("sqs", "err", err)
-		os.Exit(1)
-	}
 	rdb := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{cfg.RedisAddr}})
 	defer rdb.Close()
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -77,6 +73,31 @@ func main() {
 
 	agg := reputation.NewAggregator(rdb, cfg.App, cfg.Reputation)
 	rep := cfg.Reputation // ya trae defaults: config.Load los aplicó
+
+	if cfg.Events.Sink == events.SinkKafka {
+		k := cfg.Events.Kafka // ya trae defaults: config.Load los aplicó
+		cl, err := newKafkaConsumer(ctx, k)
+		if err != nil {
+			log.Error("kafka", "err", err)
+			os.Exit(1)
+		}
+		// Sale del consumer group: sus partitions pasan a otra réplica de inmediato.
+		// CloseAllowingRebalance (no Close) porque usamos BlockRebalanceOnPoll.
+		defer cl.CloseAllowingRebalance()
+		log.Info("aggregator", "source", "kafka", "brokers", k.Brokers, "topic", k.Topic,
+			"group", k.ConsumerGroup, "redis", cfg.RedisAddr,
+			"window", rep.Window.String(), "bucket", rep.Bucket.String(),
+			"min_distinct_ips", rep.MinDistinctIPs, "ttl", rep.TTL.String())
+		runKafka(ctx, cl, agg, log)
+		log.Info("aggregator detenido")
+		return
+	}
+
+	client, err := events.NewSQSClient(ctx)
+	if err != nil {
+		log.Error("sqs", "err", err)
+		os.Exit(1)
+	}
 	log.Info("aggregator", "queue", cfg.Events.SQS.QueueURL, "redis", cfg.RedisAddr,
 		"window", rep.Window.String(), "bucket", rep.Bucket.String(),
 		"min_distinct_ips", rep.MinDistinctIPs, "ttl", rep.TTL.String())
