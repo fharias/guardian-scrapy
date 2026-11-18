@@ -63,7 +63,7 @@ flowchart TD
 | Pieza | Paquete | Qué hace |
 | --- | --- | --- |
 | Proxy y servidores | `cmd/guardian` | YAML, HTTP, HTTPS, PROXY protocol, métricas, trazas, Valkey y apagado |
-| Agregador | `cmd/aggregator` | Lee la cola SQS, cuenta IPs distintas por JA4 y marca la reputación en Valkey |
+| Agregador | `cmd/aggregator` | Lee SQS o Kafka, cuenta IPs distintas por JA4 y marca la reputación en Valkey |
 | Reputación | `internal/reputation` | HyperLogLog por JA4 y la marca que el proxy consulta |
 | ClientHello | `internal/tlshello` | Foto del saludo TLS, JA4 y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
@@ -79,7 +79,7 @@ flowchart TD
 | Middleware | `internal/middleware` | Cadena, señales, página de desafío y corte en `block` |
 | Métricas | `internal/metrics` | Contadores, histograma y gauge de la cadena protegida |
 | Trazas | `internal/tracing` | Exporter OTLP/HTTP, muestreo y `Traceparent` hacia el upstream |
-| Eventos | `internal/events` | Veredicto hacia log, SQS o Kinesis, con la IP en HMAC y un buffer que descarta si se llena |
+| Eventos | `internal/events` | Veredicto hacia log, SQS, Kinesis o Kafka, con la IP en HMAC y un buffer que descarta si se llena |
 | Veredicto | `internal/verdict` | IP, huella, señales, score, decisión y `trace_id` |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
@@ -300,13 +300,35 @@ El evento sale cuando la cadena protegida ya volvió. `/healthz`, `/readyz` y `P
 export GUARDIAN_EVENT_SALT="$(openssl rand -hex 32)"
 ```
 
-El sink `log` escribe una línea JSON con el mensaje `event`. El sink `none` recorre el mismo buffer y no escribe esa línea. `kafka` hace fallar el arranque.
+El sink `log` escribe una línea JSON con el mensaje `event`. El sink `none` recorre el mismo buffer y no escribe esa línea.
 
-`sqs` y `kinesis` acumulan eventos y los vacían al llegar a `batch_size` o al cumplirse `flush_interval`. El valor por defecto es 100 eventos o 1 segundo. El máximo de `batch_size` es 500. `0` vuelve a 100. Cada envío, retries incluidos, tiene un tope de 5 segundos. El cuerpo es el JSON del evento.
+`sqs`, `kinesis` y `kafka` acumulan eventos y los vacían al llegar a `batch_size` o al cumplirse `flush_interval`. El valor por defecto es 100 eventos o 1 segundo. El máximo de `batch_size` es 500. `0` vuelve a 100. Cada envío, retries incluidos, tiene un tope de 5 segundos. El cuerpo es el JSON del evento.
+
+```mermaid
+flowchart TD
+  request[request] --> guardian[guardian]
+  guardian --> async["Async · buffer 1024"]
+  async --> batcher["Batcher · batch_size / flush_interval"]
+  batcher --> sender[BatchSender]
+  sender --> sqs[SQSSender]
+  sender --> kinesis[KinesisSender]
+  sender --> kafka["KafkaSender"]
+  kafka --> franz["franz-go · key ip_hash · acks all · idempotente · zstd"]
+  franz --> topic["topic guardian-events · 6 particiones"]
+  topic --> grupo["grupo guardian-aggregator"]
+  grupo --> agg["cmd/aggregator · source kafka"]
+  agg --> valkey["Valkey · HLL por JA4"]
+```
 
 SQS parte ese lote en llamadas `SendMessageBatch` de hasta 10 mensajes y 1 MiB. El YAML de Floci usa `batch_size: 10`, así un lote es una sola llamada. Kinesis usa `PutRecords`, hasta 500 registros y 10 MiB. La partition key es el JA4. Si no hay JA4, usa `ip_hash`. Si tampoco hay hash, usa `unknown`. Una key de más de 256 caracteres se recorta.
 
-Un fallo de una entrada se reintenta sola, hasta `max_retries` veces. La espera empieza en `retry_backoff` y se duplica, con tope de 2 segundos y una variación entre la mitad y el total. Los valores por defecto son 3 reintentos y 100 ms. En SQS, un fallo marcado como culpa del mensaje no se reintenta. Lo que sigue fallando suma `guardian_events_send_failures_total`.
+Un fallo de una entrada de SQS o Kinesis se reintenta sola, hasta `max_retries` veces. La espera empieza en `retry_backoff` y se duplica, con tope de 2 segundos y una variación entre la mitad y el total. Los valores por defecto son 3 reintentos y 100 ms. En SQS, un fallo marcado como culpa del mensaje no se reintenta. Lo que sigue fallando suma `guardian_events_send_failures_total`. En Kafka ese `max_retries` no se usa: franz-go reintenta hasta `delivery_timeout`.
+
+Kafka usa el mismo lote y el cliente franz-go. El topic tiene que existir; guardian no lo crea. El cliente no conecta al armarse. Al arrancar hace un ping de 3 segundos y, si el broker no responde, deja el aviso `events: kafka no responde al arrancar` y sigue. Los acks piden a todas las réplicas in-sync. El productor es idempotente. La compresión por defecto es `zstd`; también valen `none`, `gzip`, `snappy` y `lz4`. `linger` espera 5 ms por partición antes de cerrar un request. `0` vuelve a esos 5 ms. `delivery_timeout` es 4 segundos y, si se escribe, tiene que estar entre 1 y 5 segundos.
+
+La key por defecto es `ip_hash`. `ja4` usa la misma clave que Kinesis: el JA4, o `ip_hash` si no hay, o `unknown`. `none` no manda key y el particionador reparte sin conservar orden. Cada record lleva el header `content-type: application/json` y, si hay traza, `trace_id`. La hora del evento sigue en el campo `ts` del JSON. El timestamp del record es el del envío, para que un evento que esperó en el buffer no nazca ya vencido.
+
+`tls.enabled` habla TLS 1.2 o superior. `ca_file` añade un PEM de una CA propia. `sasl.mechanism` vacío no autentica. `scram-sha-512` exige TLS y las variables `GUARDIAN_KAFKA_USERNAME` y `GUARDIAN_KAFKA_PASSWORD`. `aws_msk_iam` exige TLS y la misma cadena de credenciales de AWS que SQS. El grupo de consumo por defecto es `guardian-aggregator`.
 
 La región, el endpoint y las credenciales salen del SDK: `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY`, o un rol. No van en el YAML. Al arrancar, guardian exige región y credenciales, y la lectura de credenciales tiene 5 segundos de tope. Con Floci, `AWS_ENDPOINT_URL` es `http://floci:4566` y las credenciales de prueba son `test` / `test` en `us-east-1`.
 
@@ -316,7 +338,7 @@ La región, el endpoint y las credenciales salen del SDK: `AWS_REGION`, `AWS_END
 
 `reputation.enabled` en falso no consulta Valkey y el aggregator se niega a arrancar. El `guardian-config.yml` de la raíz lo deja apagado. `deploy/compose/guardian.sqs.yml` lo enciende, con peso `ja4_reputation` 50. Si está encendido y ese peso es 0, la carga del YAML falla: la señal se calcularía y no sumaría.
 
-El aggregator, `cmd/aggregator`, lee la misma cola SQS que guardian escribe. Kinesis todavía no lo consume. Hace long poll de 20 segundos, de hasta 10 mensajes, con visibility timeout de 30 segundos. Aplica el lote en Valkey y solo entonces borra los mensajes. Si Valkey falla, los mensajes vuelven cuando vence esa visibilidad. `Apply` es idempotente: un `ip_hash` repetido no infla el conteo. Un JSON que no decodifica se borra igual, para que no vuelva en cada ciclo.
+El aggregator, `cmd/aggregator`, lee el mismo sink que guardian escribe cuando es `sqs` o `kafka`. Kinesis todavía no lo consume. Con SQS hace long poll de 20 segundos, de hasta 10 mensajes, con visibility timeout de 30 segundos. Aplica el lote en Valkey y solo entonces borra los mensajes. Si Valkey falla, los mensajes vuelven cuando vence esa visibilidad. Con Kafka entra al grupo `events.kafka.consumer_group`, pide hasta 500 records y no hace autocommit. El offset se confirma después de `Apply`. Si Valkey falla, reintenta cada 2 segundos sin confirmar, y esa partición no avanza. Un grupo sin offsets previos empieza en el record más viejo que el topic aún guarda. En los dos sinks, `Apply` es idempotente: un `ip_hash` repetido no infla el conteo. Un JSON que no decodifica se descarta y su offset o su borrado siguen con el resto del lote.
 
 Cada evento con JA4 e `ip_hash` entra en un HyperLogLog `gd:<app>:ja4ips:{<ja4>}:<bucket>`. El bucket es el de `ev.Time`, alineado a `reputation.bucket`. La llave vive `window` más un bucket. El `{ja4}` es un hash tag: en un cluster, los buckets de un mismo JA4 caen en el mismo slot y `PFCOUNT` puede unirlos. La ventana por defecto es 1 hora en buckets de 10 minutos, seis llaves. La ventana tiene que ser múltiplo del bucket y el cociente no puede pasar de 24.
 
@@ -339,7 +361,7 @@ cmd/upstream/                 binario de prueba
 internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
 internal/config/              carga y validación del YAML
-internal/events/              evento del veredicto, HMAC de la IP, buffer, SQS y Kinesis
+internal/events/              evento del veredicto, HMAC de la IP, buffer, SQS, Kinesis y Kafka
 internal/fingerprint/         huella HTTP y política JA4
 internal/ja4source/           origen del JA4: tls, cloudfront o none
 internal/goodbot/             verificación DNS de bots conocidos
@@ -372,6 +394,7 @@ Estos servicios no viven dentro del binario. Compose los levanta al lado de guar
 ![Distroless](https://img.shields.io/badge/Distroless-runtime-4285F4?logo=googlecloud&logoColor=white)
 ![Amazon SQS](https://img.shields.io/badge/Amazon_SQS-eventos-FF9900)
 ![Amazon Kinesis](https://img.shields.io/badge/Amazon_Kinesis-eventos-FF9900)
+![Apache Kafka](https://img.shields.io/badge/Kafka-4.4-231F20?logo=apachekafka&logoColor=white)
 ![Floci](https://img.shields.io/badge/Floci-2.4-111111)
 
 | | Herramienta | Dónde entra |
@@ -383,6 +406,7 @@ Estos servicios no viven dentro del binario. Compose los levanta al lado de guar
 | ![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-425CC7?logo=opentelemetry&logoColor=white) | OpenTelemetry | Spans de la cadena protegida y el `Traceparent` que guardian escribe hacia el upstream |
 | ![Amazon SQS](https://img.shields.io/badge/SQS-FF9900) | Amazon SQS | Sink `events.sink: sqs`. Los lotes salen con `SendMessageBatch`, de hasta 10 mensajes |
 | ![Amazon Kinesis](https://img.shields.io/badge/Kinesis-FF9900) | Amazon Kinesis | Sink `events.sink: kinesis`. `PutRecords` usa el JA4 como partition key y, si no hay, `ip_hash` |
+| ![Apache Kafka](https://img.shields.io/badge/Kafka-231F20?logo=apachekafka&logoColor=white) | Apache Kafka `4.4.0` | Sink `events.sink: kafka` y el aggregator. En local, un broker KRaft. En AWS, el mismo cliente habla con MSK |
 | ![Floci](https://img.shields.io/badge/Floci-111111) | Floci `2.4.0` | AWS local del perfil `aws`, en `127.0.0.1:4566`. Crea la cola y el stream `guardian-events` |
 | ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white) | Docker Compose | Stack de `deploy/compose`: proxy, upstream, Valkey, Jaeger, Prometheus, Grafana y, con el perfil `aws`, Floci |
 | ![Alpine](https://img.shields.io/badge/Alpine-0D597F?logo=alpinelinux&logoColor=white) ![Distroless](https://img.shields.io/badge/Distroless-4285F4?logo=googlecloud&logoColor=white) | Alpine y Distroless | La imagen compila con `golang:1.27.4-alpine` y corre en `gcr.io/distroless/static-debian13:nonroot` |
@@ -516,14 +540,25 @@ ja4:
 | `tracing.sample_ratio` | no | `0` | Fracción de trazas nuevas, de 0 a 1. El ejemplo usa `1` |
 | `tracing.trust_incoming` | no | `false` | Continúa el `Traceparent` de un peer en `trusted_proxies` |
 | `events.enabled` | no | `false` | Emite un evento por petición de la cadena protegida |
-| `events.sink` | no | `log` | `log`, `none`, `sqs` o `kinesis`. `kafka` y cualquier otro valor fallan el arranque |
+| `events.sink` | no | `log` | `log`, `none`, `sqs`, `kinesis` o `kafka`. Otro valor falla el arranque |
 | `events.buffer` | no | `1024` | Capacidad del canal. `0` vuelve a 1024. Un valor negativo falla el arranque |
-| `events.batch_size` | no | `100` | Eventos por lote en SQS y Kinesis. `0` vuelve a 100. Fuera de 1 a 500 falla el arranque |
+| `events.batch_size` | no | `100` | Eventos por lote en SQS, Kinesis y Kafka. `0` vuelve a 100. Fuera de 1 a 500 falla el arranque |
 | `events.flush_interval` | no | `1s` | Un lote incompleto sale igual al cumplirse este plazo. Un valor negativo falla el arranque |
-| `events.max_retries` | no | `3` | Reintentos de las entradas que fallaron. Un valor negativo falla el arranque |
+| `events.max_retries` | no | `3` | Reintentos de SQS y Kinesis. Kafka reintenta hasta `delivery_timeout`. Un valor negativo falla el arranque |
 | `events.retry_backoff` | no | `100ms` | Espera base del reintento. Se duplica en cada ronda, con tope de 2 s |
 | `events.sqs.queue_url` | con `sqs` | vacío | URL completa `http` o `https` de la cola |
 | `events.kinesis.stream_name` | con `kinesis` | vacío | Nombre del stream |
+| `events.kafka.brokers` | con `kafka` | vacío | Lista `host:puerto`. En local, `kafka:9092`. En MSK con IAM, el puerto `9098` |
+| `events.kafka.topic` | con `kafka` | vacío | Topic que ya existe. El ejemplo usa `guardian-events` |
+| `events.kafka.client_id` | no | `guardian` | Nombre que el broker ve en logs y cuotas |
+| `events.kafka.key` | no | `ip_hash` | `ip_hash`, `ja4` o `none` |
+| `events.kafka.compression` | no | `zstd` | `none`, `gzip`, `snappy`, `lz4` o `zstd` |
+| `events.kafka.linger` | no | `5ms` | Espera por partición. `0` vuelve a 5 ms. Más de 1 s falla el arranque |
+| `events.kafka.delivery_timeout` | no | `4s` | Tope de entrega de un record, entre 1 s y 5 s |
+| `events.kafka.consumer_group` | no | `guardian-aggregator` | Grupo del aggregator |
+| `events.kafka.tls.enabled` | no | `false` | TLS 1.2 o superior. Obligatorio si hay SASL |
+| `events.kafka.tls.ca_file` | no | vacío | PEM de una CA propia. Las raíces del sistema cubren MSK |
+| `events.kafka.sasl.mechanism` | no | vacío | Vacío, `scram-sha-512` o `aws_msk_iam` |
 | `scoring.weights.ja4_reputation` | no | 0 | Puntos si el JA4 está marcado. Con `reputation.enabled`, tiene que ser mayor que 0 |
 | `reputation.enabled` | no | `false` | El proxy consulta la marca y el aggregator exige que esté en verdadero |
 | `reputation.window` | no | `1h` | Ventana de IPs distintas. Múltiplo de `bucket`, y el cociente no pasa de 24 |
@@ -547,9 +582,11 @@ La carga también rechaza la configuración cuando:
 - `ja4.source` no es `tls`, `cloudfront` ni `none`, o `cloudfront` se usa sin `trusted_proxies`.
 - una entrada de `ja4.tools` no tiene `name`, el JA4 no tiene la forma `10_12_12` en minúsculas o el mismo JA4 aparece dos veces.
 - `tracing.enabled` es verdadero y falta `tracing.endpoint`, o `tracing.sample_ratio` queda fuera de 0 a 1.
-- `events.enabled` es verdadero y `events.sink` no es `log`, `none`, `sqs` ni `kinesis`.
+- `events.enabled` es verdadero y `events.sink` no es `log`, `none`, `sqs`, `kinesis` ni `kafka`.
 - `events.sink` es `sqs` y `events.sqs.queue_url` no es una URL `http` o `https` con host.
 - `events.sink` es `kinesis` y falta `events.kinesis.stream_name`.
+- `events.sink` es `kafka` y falta un broker `host:puerto` o el topic, `key` no es `ip_hash`, `ja4` ni `none`, la compresión no es una de las cinco, `linger` sale de 0 a 1 s, o `delivery_timeout` sale de 1 s a 5 s.
+- `events.kafka.sasl.mechanism` no es vacío, `scram-sha-512` ni `aws_msk_iam`, o uno de esos dos se usa sin `tls.enabled`.
 - `events.buffer`, `events.batch_size`, `events.flush_interval`, `events.max_retries` o `events.retry_backoff` es negativo, o `events.batch_size` pasa de 500.
 - `reputation.enabled` es verdadero y `scoring.weights.ja4_reputation` es 0, la ventana no es múltiplo del bucket, el cociente pasa de 24, `min_distinct_ips` es menor que 2, o `ttl` y `lookup_timeout` no son mayores que 0.
 - `events.enabled` es verdadero y `GUARDIAN_EVENT_SALT` mide menos de 16 caracteres.
@@ -603,7 +640,7 @@ El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPT
 | `guardian_events_batch_size` | histogram | `sink` | Eventos por lote. Buckets: 1, 2, 5, 10, 20, 50, 100, 200 y 500 |
 | `guardian_events_retries_total` | counter | `sink` | Rondas que reenviaron solo las entradas fallidas |
 | `guardian_events_send_failures_total` | counter | `sink` | Eventos perdidos después de agotar los reintentos |
-| `guardian_events_api_requests_total` | counter | `sink` | Llamadas `SendMessageBatch` o `PutRecords` |
+| `guardian_events_api_requests_total` | counter | `sink` | Llamadas `SendMessageBatch`, `PutRecords` o Produce de Kafka |
 
 ## Ejecutar
 
@@ -747,6 +784,17 @@ El perfil `aws` añade Floci `2.4.0` y un init que crea la cola y el stream `gua
 `deploy/compose/guardian.yml` sigue con sink `log`. Para mandar los eventos a Floci se superpone `docker-compose.aws.yml`, que monta `guardian.sqs.yml` o, con `GUARDIAN_EVENTS_SINK=kinesis`, `guardian.kinesis.yml`. Los dos apuntan Valkey a `valkey:6379` y las trazas a `jaeger:4318`. `guardian.sqs.yml` deja `ja4.source` en `cloudfront` y enciende `reputation`. `guardian.kinesis.yml` deja `ja4.source` en `none`. La cola de SQS es `http://floci:4566/000000000000/guardian-events`. El perfil `aws` es obligatorio: `floci` y `aws-init` viven ahí, y guardian espera a que el init termine bien.
 
 El mismo override levanta `cmd/aggregator`. Siempre monta `guardian.sqs.yml`, espera a Valkey sano y al init, y no publica puertos. Corre en solo lectura, sin capabilities y con `no-new-privileges`. Con `GUARDIAN_EVENTS_SINK=kinesis`, guardian escribe en el stream y el aggregator sigue leyendo la cola SQS.
+
+### Kafka local
+
+`docker-compose.kafka.yml` no usa el perfil `aws`. Levanta Apache Kafka `4.4.0` en KRaft, un solo proceso que es broker y controller, sin ZooKeeper y sin autenticación. Los contenedores lo ven en `kafka:9092`. El portátil lo ve en `127.0.0.1:9094`. El listener de controller queda en `:9093` y no se publica. `kafka-init` crea el topic `guardian-events` con 6 particiones, factor de réplica 1 y retención de un día. El broker no crea topics por su cuenta.
+
+Guardian y el aggregator montan `guardian.kafka.yml`. Ese archivo enciende la reputación con peso 50, deja `ja4.source` en `cloudfront` y apunta Valkey a `valkey:6379` y las trazas a `jaeger:4318`. Los `trusted_proxies` suman `172.16.0.0/12` y `192.168.65.0/24` a la loopback. El sink es `kafka`, el broker es `kafka:9092`, la key es `ip_hash` y el grupo es `guardian-aggregator`.
+
+```bash
+cd deploy/compose
+docker compose -f docker-compose.yml -f docker-compose.kafka.yml up -d --build
+```
 
 ```bash
 cd deploy/compose

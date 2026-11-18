@@ -20,7 +20,7 @@ type Hello struct {
 	Version     uint16
 	CipherSuite uint16
 	Protocol    string
-	// Se calculan UNA vez, al capturar el ClientHello (paso 14).
+	// Se calculan UNA vez, al capturar el ClientHello.
 	JA4            string // t13d1517h2_8daaf6152771_xxxxxxxxxxxx
 	JA4Raw         string // ja4_r: listas en claro, ordenadas
 	JA4RawOriginal string // ja4_ro: listas en claro, en el orden que llegaron

@@ -1,4 +1,4 @@
-// Package reputation agrega los eventos del pipeline de señales (paso 21):
+// Package reputation agrega los eventos del pipeline de señales:
 // cuenta IPs distintas por JA4 con HyperLogLog y, si un JA4 aparece en
 // demasiadas IPs, le deja una reputación con TTL en Redis/Valkey.
 // El aggregator escribe (Aggregator) y el proxy lee (Reader).

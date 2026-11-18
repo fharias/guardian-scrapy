@@ -180,7 +180,7 @@ func TestJA4PartA(t *testing.T) {
 	})
 }
 
-// El Chrome real de Fabio (línea tls_hello del paso 13). El log tiene nombres,
+// El Chrome real de Fabio (línea tls_hello). El log tiene nombres,
 // no hex: aquí los traducimos a mano. NO conocemos sus signature algorithms
 // (el log no los traía), así que solo verificamos ja4_a y ja4_b.
 // ja4_b coincide con el de la especificación porque los 15 ciphers son los

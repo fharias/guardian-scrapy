@@ -49,7 +49,7 @@ func (r kinesisRecord) size() int { return len(r.data) + len(r.key) }
 // PartitionKey elige la partition key de Kinesis: el JA4 del cliente y, si no
 // hay (HTTP plano, ja4.source none), el ip_hash. Kinesis aplica MD5 a la key
 // para escoger el shard, así que todos los eventos de un mismo JA4 caen en
-// el mismo shard y llegan en orden al aggregator del paso 21.
+// el mismo shard y llegan en orden al aggregator.
 func PartitionKey(ev Event) string {
 	key := ev.JA4
 	if key == "" {

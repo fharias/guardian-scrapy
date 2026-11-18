@@ -8,7 +8,7 @@ import (
 )
 
 // RouteFunc convierte un path en un label de baja cardinalidad.
-// Es la misma idea del paso 16: NUNCA el path crudo.
+// NUNCA el path crudo.
 type RouteFunc func(path string) string
 
 // Middleware emite un Event al volver de la cadena, cuando el veredicto

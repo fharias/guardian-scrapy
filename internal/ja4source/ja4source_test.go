@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	cfJA4  = "t13d1517h2_8daaf6152771_cb7bf5808d99" // el de Chrome que mediste en el paso 14
+	cfJA4  = "t13d1517h2_8daaf6152771_cb7bf5808d99" // el de Chrome medido
 	tlsJA4 = "t13d4907h2_0d8feac7bc37_7395dae3b2f3" // el de tu curl
 )
 

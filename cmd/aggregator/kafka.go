@@ -1,6 +1,6 @@
 package main
 
-// Consumer de Kafka del aggregator (paso 22). Misma semántica que SQS:
+// Consumer de Kafka del aggregator. Misma semántica que SQS:
 // at-least-once. El offset se hace commit SOLO después de aplicar el lote en
 // Valkey; si el proceso muere antes, el consumer group reentrega desde el
 // último commit, y como Apply es idempotente (PFADD), no pasa nada.

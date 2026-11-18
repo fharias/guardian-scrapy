@@ -1,7 +1,7 @@
 // Package events define la interfaz EventSink y el adaptador asíncrono
 // que aísla la latencia del proxy del destino de los eventos.
-// Destinos: log y none (paso 19), SQS y Kinesis con envío por batches (paso 20)
-// y Kafka/MSK (paso 22), los tres detrás del mismo Batcher.
+// Destinos: log y none , SQS y Kinesis con envío por batches
+// y Kafka/MSK , los tres detrás del mismo Batcher.
 package events
 
 import (
@@ -25,13 +25,13 @@ const (
 	SinkNone    = "none"
 	SinkSQS     = "sqs"
 	SinkKinesis = "kinesis"
-	SinkKafka   = "kafka" // paso 22: Kafka local o Amazon MSK (kafka.go)
+	SinkKafka   = "kafka" // Kafka local o Amazon MSK (kafka.go)
 
 	// DefaultBuffer cabe ~1 s de holgura a 1.000 req/s. Si el sink
 	// va más lento que el ingreso durante más que eso, empezamos a descartar.
 	DefaultBuffer = 1024
 
-	// Envío por batches (paso 20).
+	// Envío por batches.
 	DefaultBatchSize     = 100
 	MaxBatchSize         = 500 // tope de PutRecords; SQS lo parte en llamadas de 10
 	DefaultFlushInterval = time.Second
@@ -83,7 +83,7 @@ type Config struct {
 
 	SQS     SQSConfig     `yaml:"sqs"`
 	Kinesis KinesisConfig `yaml:"kinesis"`
-	Kafka   KafkaConfig   `yaml:"kafka"` // paso 22
+	Kafka   KafkaConfig   `yaml:"kafka"`
 }
 
 func (c Config) Validate() error {
@@ -157,7 +157,7 @@ func (c Config) WithDefaults() Config {
 }
 
 // Sink es el destino. Puede ser lento: el Async lo aísla del request.
-// SQS y Kinesis (paso 20) implementan BatchSender y el Batcher las
+// SQS y Kinesis implementan BatchSender y el Batcher las
 // convierte en un Sink: el Async no sabe que hay batches.
 type Sink interface {
 	Emit(ctx context.Context, ev Event) error

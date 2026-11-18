@@ -119,7 +119,7 @@ func TestLoadEventsBatchSettings(t *testing.T) {
 		t.Fatalf("events = %+v", e)
 	}
 
-	// Sin esas claves salen los defaults del paso 20.
+	// Sin esas claves salen los defaults.
 	path2 := filepath.Join(t.TempDir(), "guardian.yml")
 	if err := os.WriteFile(path2, []byte(base), 0o600); err != nil {
 		t.Fatal(err)

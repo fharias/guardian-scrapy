@@ -53,7 +53,7 @@ func New(source string, trusted func(*http.Request) bool) (Source, error) {
 	return nil, fmt.Errorf("ja4.source %q no es válido", source)
 }
 
-// TLS usa el JA4 que guardian calculó del ClientHello (paso 14).
+// TLS usa el JA4 que guardian calculó del ClientHello.
 type TLS struct{}
 
 func (TLS) JA4(r *http.Request) Result {

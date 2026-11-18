@@ -1,5 +1,5 @@
-// Command aggregator consume los eventos de guardian desde SQS (paso 21) o
-// desde Kafka/MSK (paso 22, kafka.go), según events.sink del mismo YAML,
+// Command aggregator consume los eventos de guardian desde SQS o
+// desde Kafka/MSK (kafka.go), según events.sink del mismo YAML,
 // cuenta IPs distintas por JA4 con HyperLogLog en Valkey y marca con TTL
 // los JA4 que aparecen en demasiadas IPs. guardian lee esa marca en el scorer.
 //
