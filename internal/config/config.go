@@ -89,7 +89,18 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error al leer el archivo de configuración: %w", err)
 	}
+	cfg, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return cfg, nil
+}
 
+// Parse convierte bytes YAML en una Config con defaults aplicados y validada.
+// No sabe de dónde salieron los bytes (archivo, S3, SSM, Redis): eso es
+// problema de la fuente. Así la misma validación protege el arranque y cada
+// recarga en caliente.
+func Parse(data []byte) (*Config, error) {
 	cfg := &Config{
 		Listen:            ":8080",
 		ReadHeaderTimeout: 5 * time.Second,
@@ -110,7 +121,7 @@ func Load(path string) (*Config, error) {
 	dec.KnownFields(true)
 
 	if err := dec.Decode(cfg); err != nil {
-		return nil, fmt.Errorf("parseando %s: %w", path, err)
+		return nil, fmt.Errorf("parseando YAML: %w", err)
 	}
 	if v := os.Getenv("GUARDIAN_UPSTREAM"); v != "" {
 		cfg.Upstream = v // la variable de entorno gana sobre el YAML
@@ -122,8 +133,12 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
-
 }
+
+// Validate expone la validación completa. La usa la recarga en caliente para
+// revisar la config YA mezclada (lo recargable del archivo nuevo + lo que
+// requiere reinicio de la config activa) antes de aplicarla.
+func (c *Config) Validate() error { return c.validate() }
 
 func (c *Config) validate() error {
 	var errs []error

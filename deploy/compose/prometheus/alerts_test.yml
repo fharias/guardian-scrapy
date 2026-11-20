@@ -33,3 +33,21 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations: { summary: "Más del 5% de los requests terminan en 5xx" }
+
+  - interval: 1m
+    input_series:
+      # 1 = la última recarga se aplicó. Se rompe en el minuto 2 y se arregla en el 9.
+      - series: 'guardian_config_last_reload_successful{job="guardian"}'
+        values: '1 1 0 0 0 0 0 0 0 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: GuardianConfigReloadFailing
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: GuardianConfigReloadFailing
+        exp_alerts:
+          - exp_labels: { severity: warning, job: guardian }
+            exp_annotations: { summary: "guardian rechazó la última config y sigue con la anterior: busca config_recarga_fallida en el log" }
+      - eval_time: 10m
+        alertname: GuardianConfigReloadFailing
+        exp_alerts: []

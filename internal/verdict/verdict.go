@@ -50,6 +50,8 @@ type Verdict struct {
 	JA4         string
 	TraceID     string
 	JA4Source   string // de dónde salió: tls, cloudfront o none
+
+	ConfigVersion string // hash de la config con la que se evaluó este request
 }
 
 func (v *Verdict) Add(points int, reason string) {

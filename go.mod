@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.18
 	github.com/aws/aws-sdk-go-v2/service/kinesis v1.56.13
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.53.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/pires/go-proxyproto v0.16.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/common v0.72.0

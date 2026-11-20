@@ -58,12 +58,18 @@ services:
       context: ../..
       args: { CMD: guardian, VERSION: dev }
     image: guardian:dev
+    # -config apunta a un archivo DENTRO del directorio montado. Los overrides
+    # (kafka, aws) solo cambian este command; el volumen es el mismo.
     command: ["-config", "/etc/guardian/guardian.yml"]
     environment:
       GUARDIAN_PASS_KEYS: ${GUARDIAN_PASS_KEYS:?define GUARDIAN_PASS_KEYS en deploy/compose/.env}
       GUARDIAN_EVENT_SALT: ${GUARDIAN_EVENT_SALT:?define GUARDIAN_EVENT_SALT en deploy/compose/.env}
     volumes:
-      - ./guardian.yml:/etc/guardian/guardian.yml:ro
+      # Se monta el DIRECTORIO, no el archivo. Un bind mount de un archivo suelto
+      # queda pegado al inode original: cuando tu editor guarda con "atomic save"
+      # (temporal + rename) el contenedor sigue viendo el archivo viejo y la
+      # recarga en caliente nunca se entera. Con el directorio, el rename se ve.
+      - ./config:/etc/guardian:ro
     ports:
       - "127.0.0.1:8080:8080"   # el 2112 NO se publica
     depends_on:

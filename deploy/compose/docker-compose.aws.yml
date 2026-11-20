@@ -14,9 +14,9 @@ services:
       AWS_ENDPOINT_URL: http://floci:4566   # el SDK v2 lo lee solo: no hay endpoint en el YAML
       AWS_ACCESS_KEY_ID: test               # credenciales falsas: solo valen para Floci
       AWS_SECRET_ACCESS_KEY: test
-    volumes:
-      # Mismo destino que en docker-compose.yml: este archivo reemplaza al guardian.yml normal.
-      - ./guardian.${GUARDIAN_EVENTS_SINK:-sqs}.yml:/etc/guardian/guardian.yml:ro
+    # El directorio ./config ya viene montado desde docker-compose.yml:
+    # aquí solo se elige otro archivo de ese directorio.
+    command: ["-config", "/etc/guardian/guardian.${GUARDIAN_EVENTS_SINK:-sqs}.yml"]
     depends_on:
       aws-init: { condition: service_completed_successfully }
   aggregator:
@@ -25,14 +25,14 @@ services:
       context: ../..
       args: { CMD: aggregator, VERSION: dev }
     image: guardian-aggregator:dev
-    command: ["-config", "/etc/guardian/guardian.yml"]
+    command: ["-config", "/etc/guardian/guardian.sqs.yml"]
     environment:
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://floci:4566
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
     volumes:
-      - ./guardian.sqs.yml:/etc/guardian/guardian.yml:ro
+      - ./config:/etc/guardian:ro
     depends_on:
       aws-init: { condition: service_completed_successfully }
       valkey: { condition: service_healthy }

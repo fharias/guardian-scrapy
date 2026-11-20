@@ -32,3 +32,10 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "guardian está usando el limitador local ({{ $labels.reason }}): revisa Valkey"
+
+      - alert: GuardianConfigReloadFailing
+        expr: guardian_config_last_reload_successful == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "guardian rechazó la última config y sigue con la anterior: busca config_recarga_fallida en el log"

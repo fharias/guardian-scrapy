@@ -52,9 +52,9 @@ services:
     restart: "no"
 
   guardian:
-    volumes:
-      # Mismo destino que en docker-compose.yml: reemplaza al guardian.yml normal.
-      - ./guardian.kafka.yml:/etc/guardian/guardian.yml:ro
+    # El directorio ./config ya viene montado desde docker-compose.yml:
+    # aquí solo se elige otro archivo de ese directorio.
+    command: ["-config", "/etc/guardian/guardian.kafka.yml"]
     depends_on:
       kafka-init: { condition: service_completed_successfully }
 
@@ -63,9 +63,9 @@ services:
       context: ../..
       args: { CMD: aggregator, VERSION: dev }
     image: guardian-aggregator:dev
-    command: ["-config", "/etc/guardian/guardian.yml"]
+    command: ["-config", "/etc/guardian/guardian.kafka.yml"]
     volumes:
-      - ./guardian.kafka.yml:/etc/guardian/guardian.yml:ro
+      - ./config:/etc/guardian:ro
     depends_on:
       kafka-init: { condition: service_completed_successfully }
       valkey: { condition: service_healthy }

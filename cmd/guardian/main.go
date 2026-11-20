@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"github.com/fharias/guardian-scrapy/internal/challenge"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
+	"github.com/fharias/guardian-scrapy/internal/configsource"
 	"github.com/fharias/guardian-scrapy/internal/events"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
@@ -51,9 +53,16 @@ var version = "dev"
 
 func main() {
 	path := flag.String("config", "guardian-config.yml", "ruta del archivo de configuración")
+	poll := flag.Duration("config-poll", 10*time.Second,
+		"revisa el archivo cada tanto aunque fsnotify no avise (0 = solo fsnotify y SIGHUP)")
 	flag.Parse()
 
-	cfg, err := config.Load(*path)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	src := configsource.NewFileSource(*path, *poll, logger)
+	// cfg es la config de ARRANQUE: todo lo que requiere reinicio (listen, TLS,
+	// upstream, Redis, events, tracing, rate/burst...) se lee de aquí una sola
+	// vez. Lo recargable se lee del snapshot vigente dentro de buildProtected.
+	cfg, cfgVersion, err := configsource.LoadInitial(context.Background(), src)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -91,7 +100,6 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 		}
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	go func() {
 		m := http.NewServeMux()
 		m.Handle("/metrics", promhttp.Handler())
@@ -119,17 +127,6 @@ func main() {
 		logger.Error("error al crear el resolver de clientip", "err", err)
 		os.Exit(1)
 	}
-	scorer, err := scoring.New(cfg.Scoring)
-	if err != nil {
-		logger.Error("scoring", "err", err)
-		os.Exit(1)
-	}
-
-	engine, err := rules.New(cfg.Rules)
-	if err != nil {
-		logger.Error("rules", "err", err)
-		os.Exit(1)
-	}
 	bots := goodbot.NewVerifier(cfg.GoodBots, net.DefaultResolver, time.Hour)
 	keys, err := challenge.ParseKeyring(os.Getenv("GUARDIAN_PASS_KEYS"))
 	if err != nil {
@@ -137,20 +134,10 @@ func main() {
 		os.Exit(1)
 	}
 	ch := challenge.NewService(keys, cfg.Challenge.Difficulty, cfg.Challenge.TTL, cfg.Challenge.PassTTL)
-	modes, err := policy.New(cfg.Modes)
-	if err != nil {
-		logger.Error("modes", "err", err)
-		os.Exit(1)
-	}
 	mets := metrics.New(prometheus.DefaultRegisterer)
-	closeEvents, emitMW, err := setupEvents(cfg.Events, logger, modes.Route)
+	closeEvents, emitFor, err := setupEvents(cfg.Events, logger)
 	if err != nil {
 		logger.Error("events", "err", err)
-		os.Exit(1)
-	}
-	ja4Policy, err := fingerprint.NewJA4Policy(cfg.JA4)
-	if err != nil {
-		logger.Error("ja4", "err", err)
 		os.Exit(1)
 	}
 	ja4Source, err := ja4source.New(cfg.JA4.Source, clientipResolver.PeerIsTrusted)
@@ -168,29 +155,64 @@ func main() {
 	step := func(name string, mw middleware.Middleware) middleware.Middleware {
 		return middleware.Traced(tracer, name, mw)
 	}
-	protected := middleware.Chain(proxy,
-		middleware.Init,
-		mets.Middleware(modes.Route),
-		emitMW,
-		middleware.Trace(tracer, middleware.TraceOptions{
-			Route: modes.Route,
-			TrustIncoming: func(r *http.Request) bool {
-				return cfg.Tracing.TrustIncoming && clientipResolver.PeerIsTrusted(r)
-			},
-		}),
-		step("clientip", middleware.ClientIP(clientipResolver)),
-		middleware.Logger(logger),
-		step("suspiciousua", middleware.SuspiciousUA()),
-		step("fingerprint", middleware.Fingerprint()),
-		step("ja4", middleware.JA4(ja4Source, logger)),
+	// buildProtected arma la cadena COMPLETA con una config ya validada. Corre
+	// al arrancar y en cada recarga. Las piezas recargables (scorer, rules,
+	// modes, ja4Policy) se crean aquí, nuevas cada vez; las que cargan estado
+	// (store, repReader, bots, ch, clientipResolver, ja4Source, proxy, mets)
+	// se crearon arriba una sola vez y se reutilizan.
+	buildProtected := func(c *config.Config, version string) (http.Handler, error) {
+		scorer, err := scoring.New(c.Scoring)
+		if err != nil {
+			return nil, fmt.Errorf("scoring: %w", err)
+		}
+		engine, err := rules.New(c.Rules)
+		if err != nil {
+			return nil, fmt.Errorf("rules: %w", err)
+		}
+		modes, err := policy.New(c.Modes)
+		if err != nil {
+			return nil, fmt.Errorf("modes: %w", err)
+		}
+		ja4Policy, err := fingerprint.NewJA4Policy(c.JA4)
+		if err != nil {
+			return nil, fmt.Errorf("ja4: %w", err)
+		}
+		return middleware.Chain(proxy,
+			middleware.Init,
+			middleware.ConfigVersion(version),
+			mets.Middleware(modes.Route),
+			emitFor(modes.Route),
+			middleware.Trace(tracer, middleware.TraceOptions{
+				Route: modes.Route,
+				TrustIncoming: func(r *http.Request) bool {
+					return cfg.Tracing.TrustIncoming && clientipResolver.PeerIsTrusted(r)
+				},
+			}),
+			step("clientip", middleware.ClientIP(clientipResolver)),
+			middleware.Logger(logger),
+			step("suspiciousua", middleware.SuspiciousUA()),
+			step("fingerprint", middleware.Fingerprint()),
+			step("ja4", middleware.JA4(ja4Source, logger)),
 
-		step("ja4mismatch", middleware.JA4Mismatch(ja4Policy)),
-		step("reputation", middleware.Reputation(repReader, logger)),
-		step("rules", middleware.Rules(engine, bots, 300*time.Millisecond)),
-		step("ratelimit", middleware.RateLimit(store, logger)),
-		step("score", middleware.Score(scorer)),
-		step("enforce", middleware.Enforce(ch, modes, logger)),
-	)
+			step("ja4mismatch", middleware.JA4Mismatch(ja4Policy)),
+			step("reputation", middleware.Reputation(repReader, logger)),
+			step("rules", middleware.Rules(engine, bots, 300*time.Millisecond)),
+			step("ratelimit", middleware.RateLimit(store, logger)),
+			step("score", middleware.Score(scorer)),
+			step("enforce", middleware.Enforce(ch, modes, logger)),
+		), nil
+	}
+	reloader, err := configsource.New(src, cfg, cfgVersion, buildProtected, configsource.Options{
+		Logger:     logger,
+		Registerer: prometheus.DefaultRegisterer,
+	})
+	if err != nil {
+		logger.Error("config", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("config", "source", src.Name(), "version", cfgVersion,
+		"poll", poll.String(), "recargable", config.Reloadable)
+	protected := configsource.Handler(reloader)
 	verify := middleware.Chain(middleware.VerifyHandler(ch, logger),
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
@@ -256,6 +278,23 @@ func main() {
 		"sample_ratio", cfg.Tracing.SampleRatio, "trust_incoming", cfg.Tracing.TrustIncoming)
 	local.StartJanitor(ctx, time.Minute, logger)
 	defer stop()
+
+	// Recarga en caliente: fsnotify + poll dentro de Run; SIGHUP como disparador
+	// manual. Ojo: si no capturas SIGHUP, su acción por defecto MATA el proceso.
+	go reloader.Run(ctx)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				reloader.Trigger("sighup")
+			}
+		}
+	}()
 	logger.Info("ja4", "source", cfg.JA4.Source)
 	logger.Info("listener", "addr", cfg.Listen, "proxy_protocol", cfg.ProxyProtocol, "trusted", cfg.TrustedProxies)
 
@@ -309,9 +348,15 @@ func main() {
 	log.Println("apagado limpio")
 
 }
-func setupEvents(cfg events.Config, logger *slog.Logger, route events.RouteFunc) (func(context.Context) error, middleware.Middleware, error) {
+
+// setupEvents crea el sink y el Async UNA vez (tienen conexiones y buffers) y
+// devuelve una fábrica de middleware: cada cadena reconstruida en una recarga
+// pide el suyo con el RouteFunc de sus propios modes.
+func setupEvents(cfg events.Config, logger *slog.Logger) (func(context.Context) error, func(events.RouteFunc) middleware.Middleware, error) {
 	noopClose := func(context.Context) error { return nil }
-	passthrough := func(next http.Handler) http.Handler { return next }
+	passthrough := func(events.RouteFunc) middleware.Middleware {
+		return func(next http.Handler) http.Handler { return next }
+	}
 	if !cfg.Enabled {
 		logger.Info("events", "enabled", false)
 		return noopClose, passthrough, nil
@@ -328,5 +373,7 @@ func setupEvents(cfg events.Config, logger *slog.Logger, route events.RouteFunc)
 	eff := cfg.WithDefaults()
 	logger.Info("events", "enabled", true, "sink", eff.Sink, "buffer", eff.Buffer,
 		"batch_size", eff.BatchSize, "flush_interval", eff.FlushInterval.String())
-	return async.Close, events.Middleware(async, hasher, route), nil
+	return async.Close, func(route events.RouteFunc) middleware.Middleware {
+		return events.Middleware(async, hasher, route)
+	}, nil
 }

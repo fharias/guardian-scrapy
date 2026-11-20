@@ -336,7 +336,7 @@ La región, el endpoint y las credenciales salen del SDK: `AWS_REGION`, `AWS_END
 
 ### Reputación de JA4
 
-`reputation.enabled` en falso no consulta Valkey y el aggregator se niega a arrancar. El `guardian-config.yml` de la raíz lo deja apagado. `deploy/compose/guardian.sqs.yml` lo enciende, con peso `ja4_reputation` 50. Si está encendido y ese peso es 0, la carga del YAML falla: la señal se calcularía y no sumaría.
+`reputation.enabled` en falso no consulta Valkey y el aggregator se niega a arrancar. El `guardian-config.yml` de la raíz lo deja apagado. `deploy/compose/config/guardian.sqs.yml` lo enciende, con peso `ja4_reputation` 50. Si está encendido y ese peso es 0, la carga del YAML falla: la señal se calcularía y no sumaría.
 
 El aggregator, `cmd/aggregator`, lee el mismo sink que guardian escribe cuando es `sqs` o `kafka`. Kinesis todavía no lo consume. Con SQS hace long poll de 20 segundos, de hasta 10 mensajes, con visibility timeout de 30 segundos. Aplica el lote en Valkey y solo entonces borra los mensajes. Si Valkey falla, los mensajes vuelven cuando vence esa visibilidad. Con Kafka entra al grupo `events.kafka.consumer_group`, pide hasta 500 records y no hace autocommit. El offset se confirma después de `Apply`. Si Valkey falla, reintenta cada 2 segundos sin confirmar, y esa partición no avanza. Un grupo sin offsets previos empieza en el record más viejo que el topic aún guarda. En los dos sinks, `Apply` es idempotente: un `ip_hash` repetido no infla el conteo. Un JSON que no decodifica se descarta y su offset o su borrado siguen con el resto del lote.
 
@@ -593,6 +593,26 @@ La carga también rechaza la configuración cuando:
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase. `GUARDIAN_EVENT_SALT` es obligatoria solo cuando `events.enabled` es verdadero.
 
+## Recarga en caliente
+
+`guardian` vigila el archivo de `-config` y aplica sin reiniciar los bloques `scoring`, `rules`, `modes` y `ja4.tools`. Los requests que ya empezaron terminan con la config que tenían; los nuevos usan la nueva.
+
+- Se vigila el directorio del archivo con fsnotify, así que funcionan el guardado atómico de los editores (temporal + rename) y el symlink `..data` de un ConfigMap de Kubernetes.
+- `-config-poll` (10 s por defecto, `0` lo apaga) relee el archivo aunque fsnotify no avise. Si el hash no cambió, no pasa nada.
+- `SIGHUP` pide una recarga a mano: `docker compose kill -s HUP guardian`.
+- Los avisos se agrupan 250 ms (debounce) y se recarga una sola vez.
+- La config nueva se parsea, se valida mezclada con lo que requiere reinicio y se construye entera antes de publicarse. Si algo falla, sigue la anterior y el log dice `config_recarga_fallida`.
+- Un cambio en cualquier otro campo (`listen`, `tls`, `upstream`, timeouts, `redis_addr`, `rate`, `burst`, `trusted_proxies`, `ja4.source`, `challenge`, `good_bots`, `events`, `tracing`, `reputation`) se ignora con el warning `config_requiere_reinicio`.
+
+| Métrica | Tipo | Qué dice |
+| --- | --- | --- |
+| `guardian_config_reloads_total{result}` | counter | recargas `ok` y `error` |
+| `guardian_config_last_reload_successful` | gauge | 1 si la última se aplicó, 0 si se rechazó |
+| `guardian_config_last_reload_success_timestamp_seconds` | gauge | cuándo se publicó la config activa |
+| `guardian_config_info{version}` | gauge | siempre 1; `version` es el hash (12 hex de SHA-256) de la config activa |
+
+Cada línea `request` del log lleva `config_version`.
+
 ## Salud y apagado
 
 `GET /healthz` y `GET /readyz` no pasan por la cadena protegida. Mientras el proceso está listo, las dos responden `200`. Después de `SIGINT` o `SIGTERM`, `/healthz` responde `503`. `/readyz` no escribe un estado en ese tramo, y la respuesta que completa el servidor sigue siendo `200`.
@@ -730,7 +750,7 @@ curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Acc
 
 `deploy/compose/docker-compose.yml` levanta Valkey `9.1.3` sin persistencia, el upstream de prueba, Jaeger `2.23.0`, guardian, Prometheus `v3.16.0` y Grafana `13.0.12`. El perfil `demo` añade un bucle de `curl`.
 
-La imagen sale del `Dockerfile`: Go `1.27.4` sobre Alpine, binario estático y runtime `gcr.io/distroless/static-debian13:nonroot`. `CMD` elige `./cmd/guardian` o `./cmd/upstream`. `VERSION` se escribe en `main.version`; el compose la deja en `dev`. El contenedor de guardian monta el YAML en solo lectura, arranca con `read_only`, sin capabilities y con `no-new-privileges`.
+La imagen sale del `Dockerfile`: Go `1.27.4` sobre Alpine, binario estático y runtime `gcr.io/distroless/static-debian13:nonroot`. `CMD` elige `./cmd/guardian` o `./cmd/upstream`. `VERSION` se escribe en `main.version`; el compose la deja en `dev`. El contenedor de guardian monta el directorio `deploy/compose/config` en `/etc/guardian`, en solo lectura, arranca con `read_only`, sin capabilities y con `no-new-privileges`.
 
 Los puertos publicados escuchan solo en `127.0.0.1`:
 
@@ -757,7 +777,7 @@ flowchart LR
   guardian --> upstream
 ```
 
-`deploy/compose/guardian.yml` es el YAML de ejemplo con el upstream en `http://upstream:9000` y el bloque `tls` comentado, así que este stack no abre `:8443`. `redis_addr` sigue en `localhost:6379` y `tracing.endpoint` en `localhost:4318`. Dentro del contenedor esas direcciones son el propio guardian. Valkey es el servicio `valkey` y Jaeger recibe OTLP en `jaeger:4318`. Con el archivo tal como está, el límite de tasa usa el limitador en memoria y los spans no llegan a Jaeger.
+`deploy/compose/config/guardian.yml` es el YAML de ejemplo con el upstream en `http://upstream:9000` y el bloque `tls` comentado, así que este stack no abre `:8443`. `redis_addr` sigue en `localhost:6379` y `tracing.endpoint` en `localhost:4318`. Dentro del contenedor esas direcciones son el propio guardian. Valkey es el servicio `valkey` y Jaeger recibe OTLP en `jaeger:4318`. Con el archivo tal como está, el límite de tasa usa el limitador en memoria y los spans no llegan a Jaeger.
 
 Hace falta `deploy/compose/.env`, a partir de `.env.example`. Compose no arranca si faltan `GUARDIAN_PASS_KEYS`, `GRAFANA_ADMIN_PASSWORD` o `GUARDIAN_EVENT_SALT`. El YAML del stack deja `events.enabled` en verdadero, así que esa sal tiene que medir al menos 16 caracteres. El `.env` no se versiona.
 
@@ -781,15 +801,15 @@ Grafana provisiona Prometheus como datasource por defecto y Jaeger en `http://ja
 
 El perfil `aws` añade Floci `2.4.0` y un init que crea la cola y el stream `guardian-events`. Floci escucha en `127.0.0.1:4566` y dentro de la red en `http://floci:4566`. No monta el socket de Docker: SQS y Kinesis corren dentro del proceso, y el aviso de que Docker no está disponible es el comportamiento esperado. El init usa la imagen `amazon/aws-cli:2.40.3`, la región `us-east-1` y las credenciales `test` / `test`.
 
-`deploy/compose/guardian.yml` sigue con sink `log`. Para mandar los eventos a Floci se superpone `docker-compose.aws.yml`, que monta `guardian.sqs.yml` o, con `GUARDIAN_EVENTS_SINK=kinesis`, `guardian.kinesis.yml`. Los dos apuntan Valkey a `valkey:6379` y las trazas a `jaeger:4318`. `guardian.sqs.yml` deja `ja4.source` en `cloudfront` y enciende `reputation`. `guardian.kinesis.yml` deja `ja4.source` en `none`. La cola de SQS es `http://floci:4566/000000000000/guardian-events`. El perfil `aws` es obligatorio: `floci` y `aws-init` viven ahí, y guardian espera a que el init termine bien.
+`deploy/compose/config/guardian.yml` sigue con sink `log`. Para mandar los eventos a Floci se superpone `docker-compose.aws.yml`, que arranca guardian con `config/guardian.sqs.yml` o, con `GUARDIAN_EVENTS_SINK=kinesis`, `guardian.kinesis.yml`. Los dos apuntan Valkey a `valkey:6379` y las trazas a `jaeger:4318`. `guardian.sqs.yml` deja `ja4.source` en `cloudfront` y enciende `reputation`. `guardian.kinesis.yml` deja `ja4.source` en `none`. La cola de SQS es `http://floci:4566/000000000000/guardian-events`. El perfil `aws` es obligatorio: `floci` y `aws-init` viven ahí, y guardian espera a que el init termine bien.
 
-El mismo override levanta `cmd/aggregator`. Siempre monta `guardian.sqs.yml`, espera a Valkey sano y al init, y no publica puertos. Corre en solo lectura, sin capabilities y con `no-new-privileges`. Con `GUARDIAN_EVENTS_SINK=kinesis`, guardian escribe en el stream y el aggregator sigue leyendo la cola SQS.
+El mismo override levanta `cmd/aggregator`. Siempre lee `config/guardian.sqs.yml`, espera a Valkey sano y al init, y no publica puertos. Corre en solo lectura, sin capabilities y con `no-new-privileges`. Con `GUARDIAN_EVENTS_SINK=kinesis`, guardian escribe en el stream y el aggregator sigue leyendo la cola SQS.
 
 ### Kafka local
 
 `docker-compose.kafka.yml` no usa el perfil `aws`. Levanta Apache Kafka `4.4.0` en KRaft, un solo proceso que es broker y controller, sin ZooKeeper y sin autenticación. Los contenedores lo ven en `kafka:9092`. El portátil lo ve en `127.0.0.1:9094`. El listener de controller queda en `:9093` y no se publica. `kafka-init` crea el topic `guardian-events` con 6 particiones, factor de réplica 1 y retención de un día. El broker no crea topics por su cuenta.
 
-Guardian y el aggregator montan `guardian.kafka.yml`. Ese archivo enciende la reputación con peso 50, deja `ja4.source` en `cloudfront` y apunta Valkey a `valkey:6379` y las trazas a `jaeger:4318`. Los `trusted_proxies` suman `172.16.0.0/12` y `192.168.65.0/24` a la loopback. El sink es `kafka`, el broker es `kafka:9092`, la key es `ip_hash` y el grupo es `guardian-aggregator`.
+Guardian y el aggregator leen `config/guardian.kafka.yml`. Ese archivo enciende la reputación con peso 50, deja `ja4.source` en `cloudfront` y apunta Valkey a `valkey:6379` y las trazas a `jaeger:4318`. Los `trusted_proxies` suman `172.16.0.0/12` y `192.168.65.0/24` a la loopback. El sink es `kafka`, el broker es `kafka:9092`, la key es `ip_hash` y el grupo es `guardian-aggregator`.
 
 ```bash
 cd deploy/compose
@@ -810,7 +830,7 @@ awsl sqs list-queues
 awsl kinesis list-streams
 ```
 
-`deploy/compose/prometheus/alerts.yml` define cuatro alertas del job `guardian`:
+`deploy/compose/prometheus/alerts.yml` define cinco alertas del job `guardian`:
 
 | Alerta | Condición | Durante | Severidad |
 | --- | --- | --- | --- |
@@ -818,6 +838,7 @@ awsl kinesis list-streams
 | `GuardianHighErrorRate` | más del 5 % de los requests en 5xx | 5 minutos | `critical` |
 | `GuardianHighLatencyP99` | p99 por encima de 500 ms | 10 minutos | `warning` |
 | `GuardianFailOpen` | algún `guardian_fail_open_total` en la ventana de 5 minutos | 2 minutos | `warning` |
+| `GuardianConfigReloadFailing` | `guardian_config_last_reload_successful == 0` | 5 minutos | `warning` |
 
 `alerts_test.yml` es la prueba de `promtool` y Prometheus no la carga. Se corre desde `deploy/compose/prometheus`:
 

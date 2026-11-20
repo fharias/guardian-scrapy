@@ -35,6 +35,21 @@ func Init(next http.Handler) http.Handler {
 	})
 }
 
+// ConfigVersion deja en el veredicto el hash de la config con la que se
+// construyó esta cadena. Como la cadena entera se reconstruye en cada recarga,
+// el valor queda fijo dentro de la closure: el log de cada request dice con
+// qué config se evaluó, aunque haya terminado después de una recarga.
+func ConfigVersion(version string) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil {
+				v.ConfigVersion = version
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // Registra la solicitud y el resultado de la verificación de acceso
 func Logger(log *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
@@ -62,6 +77,9 @@ func Logger(log *slog.Logger) Middleware {
 			}
 			if v.JA4Source != "" {
 				attrs = append(attrs, "ja4", v.JA4, "ja4_source", v.JA4Source)
+			}
+			if v.ConfigVersion != "" {
+				attrs = append(attrs, "config_version", v.ConfigVersion)
 			}
 			if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
 				attrs = append(attrs, "trace_id", sc.TraceID().String())
