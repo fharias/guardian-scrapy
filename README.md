@@ -52,22 +52,23 @@ flowchart LR
   reverso --> origen
 ```
 
-La cadena se ejecuta en este orden. `Metrics` mide la petición al volver del resto. `Events` emite el veredicto ya cerrado, también al volver. `Trace` abre el span raíz, copia su `trace_id` al veredicto y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
+La cadena se ejecuta en este orden. `ConfigVersion` deja en el veredicto el hash del archivo con el que se armó esta cadena. `Metrics` mide la petición al volver del resto. `Events` emite el veredicto ya cerrado, también al volver. `Trace` abre el span raíz, copia su `trace_id` al veredicto y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
 
 ```mermaid
 flowchart TD
-  init[Init] --> mets[Metrics] --> events[Events] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA]
+  init[Init] --> ver[ConfigVersion] --> mets[Metrics] --> events[Events] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA]
   ua --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rep[Reputation] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
 | --- | --- | --- |
-| Proxy y servidores | `cmd/guardian` | YAML, HTTP, HTTPS, PROXY protocol, métricas, trazas, Valkey y apagado |
+| Proxy y servidores | `cmd/guardian` | YAML con recarga en caliente, HTTP, HTTPS, PROXY protocol, métricas, trazas, Valkey y apagado |
 | Agregador | `cmd/aggregator` | Lee SQS o Kafka, cuenta IPs distintas por JA4 y marca la reputación en Valkey |
 | Reputación | `internal/reputation` | HyperLogLog por JA4 y la marca que el proxy consulta |
 | ClientHello | `internal/tlshello` | Foto del saludo TLS, JA4 y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
-| Configuración | `internal/config` | Carga y validación del YAML |
+| Configuración | `internal/config` | Parseo, validación y la lista de campos que se pueden recargar |
+| Fuente de config | `internal/configsource` | Lee el archivo, vigila el directorio y publica un snapshot inmutable por recarga |
 | IP del cliente | `internal/clientip` | Elige la IP real a partir del peer y de la cabecera configurada |
 | Huella | `internal/fingerprint` | Resume las cabeceras y compara el JA4 con herramientas conocidas |
 | Origen del JA4 | `internal/ja4source` | Elige el JA4 del ClientHello, de CloudFront o de ninguno |
@@ -80,7 +81,7 @@ flowchart TD
 | Métricas | `internal/metrics` | Contadores, histograma y gauge de la cadena protegida |
 | Trazas | `internal/tracing` | Exporter OTLP/HTTP, muestreo y `Traceparent` hacia el upstream |
 | Eventos | `internal/events` | Veredicto hacia log, SQS, Kinesis o Kafka, con la IP en HMAC y un buffer que descarta si se llena |
-| Veredicto | `internal/verdict` | IP, huella, señales, score, decisión y `trace_id` |
+| Veredicto | `internal/verdict` | IP, huella, señales, score, decisión, `trace_id` y `config_version` |
 | Límite de tasa | `internal/ratelimit` | Token bucket en Valkey, memoria y failover |
 
 ### IP del cliente
@@ -259,7 +260,7 @@ flowchart TD
 
 Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`, y dejan un evento `fail_open` con ese `reason` en el span `mw.ratelimit`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos y duración. Si hubo un origen de JA4, suma `ja4` y `ja4_source`. En HTTPS suma también `tls_version` y `sni`. Si el span de la petición es válido, suma `trace_id`.
+El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos, duración y `config_version`. Si hubo un origen de JA4, suma `ja4` y `ja4_source`. En HTTPS suma también `tls_version` y `sni`. Si el span de la petición es válido, suma `trace_id`.
 
 ### Trazas
 
@@ -269,7 +270,7 @@ Con el bloque activo, guardian crea un `TracerProvider` por lotes y lo envía po
 
 `Trace` solo envuelve la cadena protegida. `/healthz`, `/readyz` y `POST /__guardian/verify` no abren span. El nombre del span raíz es el método y el prefijo de `modes.routes` que gana, el mismo label `route` de las métricas: `GET /api`, `GET /api/checkout` o `GET default`. El método admite `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT` y `TRACE`. Cualquier otro queda en `_OTHER`. Al cerrar, el span guarda `http.response.status_code` y, si hay veredicto, `guardian.decision`, `guardian.score`, `guardian.mode`, `guardian.shadow`, `guardian.reasons` y `guardian.ja4_source`. Un status de 500 o más marca el span como error.
 
-Cada paso envuelto cuelga de ese raíz y termina cuando llama al siguiente, así que no se solapan y no incluyen el tiempo del resto de la cadena. `Init`, `Metrics` y `Logger` no tienen span propio. El raíz sigue abierto hasta que la respuesta vuelve, incluido el upstream.
+Cada paso envuelto cuelga de ese raíz y termina cuando llama al siguiente, así que no se solapan y no incluyen el tiempo del resto de la cadena. `Init`, `ConfigVersion`, `Metrics`, `Events` y `Logger` no tienen span propio. El raíz sigue abierto hasta que la respuesta vuelve, incluido el upstream.
 
 ```mermaid
 flowchart TD
@@ -360,7 +361,8 @@ cmd/aggregator/               consume SQS y marca JA4 en Valkey
 cmd/upstream/                 binario de prueba
 internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
-internal/config/              carga y validación del YAML
+internal/config/              parseo, validación y campos recargables
+internal/configsource/        archivo, fsnotify, poll, SIGHUP y snapshot de la cadena
 internal/events/              evento del veredicto, HMAC de la IP, buffer, SQS, Kinesis y Kafka
 internal/fingerprint/         huella HTTP y política JA4
 internal/ja4source/           origen del JA4: tls, cloudfront o none
@@ -420,7 +422,7 @@ La región, el endpoint y las credenciales de SQS y Kinesis salen de `AWS_REGION
 
 ## Configuración
 
-`guardian` lee `guardian-config.yml` por defecto. Otra ruta se pasa con `-config`.
+`guardian` lee `guardian-config.yml` por defecto. Otra ruta se pasa con `-config`. `-config-poll` espera 10 segundos entre relecturas; `0` deja solo fsnotify y `SIGHUP`. El aggregator usa el mismo `-config` y lo lee una sola vez al arrancar.
 
 ```yaml
 listen: ":8080"
@@ -595,23 +597,27 @@ La carga también rechaza la configuración cuando:
 
 ## Recarga en caliente
 
-`guardian` vigila el archivo de `-config` y aplica sin reiniciar los bloques `scoring`, `rules`, `modes` y `ja4.tools`. Los requests que ya empezaron terminan con la config que tenían; los nuevos usan la nueva.
+`guardian` vigila el archivo de `-config` y, sin reiniciar, vuelve a armar la cadena protegida cuando cambian `scoring`, `rules`, `modes` o `ja4.tools`. Cada request lee el snapshot una vez al entrar y lo usa hasta el final. `POST /__guardian/verify` y el aggregator quedan con la config de arranque.
 
-- Se vigila el directorio del archivo con fsnotify, así que funcionan el guardado atómico de los editores (temporal + rename) y el symlink `..data` de un ConfigMap de Kubernetes.
-- `-config-poll` (10 s por defecto, `0` lo apaga) relee el archivo aunque fsnotify no avise. Si el hash no cambió, no pasa nada.
-- `SIGHUP` pide una recarga a mano: `docker compose kill -s HUP guardian`.
-- Los avisos se agrupan 250 ms (debounce) y se recarga una sola vez.
-- La config nueva se parsea, se valida mezclada con lo que requiere reinicio y se construye entera antes de publicarse. Si algo falla, sigue la anterior y el log dice `config_recarga_fallida`.
-- Un cambio en cualquier otro campo (`listen`, `tls`, `upstream`, timeouts, `redis_addr`, `rate`, `burst`, `trusted_proxies`, `ja4.source`, `challenge`, `good_bots`, `events`, `tracing`, `reputation`) se ignora con el warning `config_requiere_reinicio`.
+En cada recarga se reconstruyen el scorer, las reglas, los modos y la política de JA4. El resto se creó al arrancar y se reutiliza: listeners, TLS, upstream, Valkey, el límite de tasa, el desafío, los bots, el origen del JA4, la reputación, los eventos y las trazas.
+
+- Se vigila el directorio del archivo con fsnotify. Ahí se ven el guardado atómico de un editor (temporal y rename) y el symlink `..data` de un ConfigMap de Kubernetes. Un `chmod` no dispara recarga.
+- `-config-poll` (10 s por defecto, `0` lo apaga) relee el archivo aunque fsnotify no avise. Si el hash no cambió, el log de debug dice `config_sin_cambios`.
+- Si fsnotify no arranca y `-config-poll` es `0`, el log deja `config_watch` y la recarga que queda es `SIGHUP`.
+- `SIGHUP` pide una recarga a mano: `docker compose kill -s HUP guardian`. Guardian captura esa señal.
+- Los avisos se agrupan 250 ms y se recarga una sola vez. Ese plazo no tiene flag.
+- La versión son los primeros 12 hexadecimales del SHA-256 de los bytes del archivo. `guardian_config_info` y el campo `config_version` del log `request` de la cadena protegida muestran ese valor. El log de `POST /__guardian/verify` no lo lleva.
+- La config nueva se parsea y se mezcla con lo que quedó fijo al arrancar. Esa mezcla se valida y la cadena se construye entera antes de publicarse. Si algo falla, sigue la anterior, `guardian_config_last_reload_successful` pasa a 0 y el log dice `config_recarga_fallida`. Un poll posterior del mismo archivo rechazado no repite ese error. Un fallo al arrancar termina el proceso, porque todavía no hay config anterior.
+- Bajar `scoring.weights.ja4_reputation` a 0 mientras `reputation.enabled` quedó en verdadero al arrancar no se aplica: la mezcla no pasa la validación.
+- Un cambio fuera de esos cuatro bloques (`listen`, `tls`, `upstream`, timeouts, `redis_addr`, `rate`, `burst`, `trusted_proxies`, `ja4.source`, `challenge`, `good_bots`, `events`, `tracing`, `reputation`) deja el warning `config_requiere_reinicio` y el proceso sigue con el valor de arranque. Si el archivo igual es válido, la versión avanza, porque el hash es el del archivo. En el diff del log, un campo cuyo nombre contiene `password`, `secret`, `token` o `key_file` sale como `***`.
+- Una recarga aplicada deja la línea `config_recargada` con la versión anterior, la nueva, el motivo, los cambios y `dur_ms`. Las series `ok` y `error` de `guardian_config_reloads_total` existen desde el arranque.
 
 | Métrica | Tipo | Qué dice |
 | --- | --- | --- |
-| `guardian_config_reloads_total{result}` | counter | recargas `ok` y `error` |
-| `guardian_config_last_reload_successful` | gauge | 1 si la última se aplicó, 0 si se rechazó |
-| `guardian_config_last_reload_success_timestamp_seconds` | gauge | cuándo se publicó la config activa |
-| `guardian_config_info{version}` | gauge | siempre 1; `version` es el hash (12 hex de SHA-256) de la config activa |
-
-Cada línea `request` del log lleva `config_version`.
+| `guardian_config_reloads_total{result}` | counter | recargas `ok` y `error`. Las dos series existen desde el arranque |
+| `guardian_config_last_reload_successful` | gauge | 1 si la última se aplicó, 0 si se rechazó. Al arrancar vale 1 |
+| `guardian_config_last_reload_success_timestamp_seconds` | gauge | cuándo se publicó la config activa, incluida la de arranque |
+| `guardian_config_info{version}` | gauge | siempre 1; `version` es el hash de 12 hex del archivo publicado |
 
 ## Salud y apagado
 
@@ -750,7 +756,7 @@ curl -s -A "Mozilla/5.0" -H "Accept: text/html" -H "Accept-Language: es" -H "Acc
 
 `deploy/compose/docker-compose.yml` levanta Valkey `9.1.3` sin persistencia, el upstream de prueba, Jaeger `2.23.0`, guardian, Prometheus `v3.16.0` y Grafana `13.0.12`. El perfil `demo` añade un bucle de `curl`.
 
-La imagen sale del `Dockerfile`: Go `1.27.4` sobre Alpine, binario estático y runtime `gcr.io/distroless/static-debian13:nonroot`. `CMD` elige `./cmd/guardian` o `./cmd/upstream`. `VERSION` se escribe en `main.version`; el compose la deja en `dev`. El contenedor de guardian monta el directorio `deploy/compose/config` en `/etc/guardian`, en solo lectura, arranca con `read_only`, sin capabilities y con `no-new-privileges`.
+La imagen sale del `Dockerfile`: Go `1.27.4` sobre Alpine, binario estático y runtime `gcr.io/distroless/static-debian13:nonroot`. `CMD` elige `./cmd/guardian` o `./cmd/upstream`. `VERSION` se escribe en `main.version`; el compose la deja en `dev`. El contenedor de guardian monta el directorio `deploy/compose/config` en `/etc/guardian`, en solo lectura, y arranca con `-config /etc/guardian/guardian.yml`. El montaje es el directorio para que un guardado atómico del host se vea dentro del contenedor. El contenedor arranca con `read_only`, sin capabilities y con `no-new-privileges`.
 
 Los puertos publicados escuchan solo en `127.0.0.1`:
 
