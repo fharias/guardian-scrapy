@@ -5,12 +5,10 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -25,24 +23,20 @@ import (
 
 	"github.com/fharias/guardian-scrapy/internal/acl"
 	"github.com/fharias/guardian-scrapy/internal/admin"
+	"github.com/fharias/guardian-scrapy/internal/apps"
 	"github.com/fharias/guardian-scrapy/internal/challenge"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
 	"github.com/fharias/guardian-scrapy/internal/configsource"
 	"github.com/fharias/guardian-scrapy/internal/events"
-	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
 	"github.com/fharias/guardian-scrapy/internal/ja4source"
 	"github.com/fharias/guardian-scrapy/internal/metrics"
 	"github.com/fharias/guardian-scrapy/internal/middleware"
-	"github.com/fharias/guardian-scrapy/internal/policy"
 	"github.com/fharias/guardian-scrapy/internal/ratelimit"
 	"github.com/fharias/guardian-scrapy/internal/reputation"
-	"github.com/fharias/guardian-scrapy/internal/rules"
-	"github.com/fharias/guardian-scrapy/internal/scoring"
 	"github.com/fharias/guardian-scrapy/internal/tlshello"
 	"github.com/fharias/guardian-scrapy/internal/tracing"
-	"github.com/fharias/guardian-scrapy/internal/verdict"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 )
@@ -63,28 +57,11 @@ func main() {
 	src := configsource.NewFileSource(*path, *poll, logger)
 	// cfg es la config de ARRANQUE: todo lo que requiere reinicio (listen, TLS,
 	// upstream, Redis, events, tracing, rate/burst...) se lee de aquí una sola
-	// vez. Lo recargable se lee del snapshot vigente dentro de buildProtected.
+	// vez. Lo recargable (incluida la sección apps) se lee del snapshot vigente
+	// dentro de chainDeps.build (build.go).
 	cfg, cfgVersion, err := configsource.LoadInitial(context.Background(), src)
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(cfg.UpstreamURL)
-			pr.SetXForwarded()
-			if v := verdict.From(pr.In.Context()); v != nil && v.ClientIP.IsValid() {
-				pr.Out.Header.Set("X-Forwarded-For", v.ClientIP.String())
-			}
-			if cfg.PreserveHost {
-				pr.Out.Host = pr.In.Host
-			}
-			tracing.InjectUpstream(pr.Out)
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("error hacia upstream: %v", err)
-			http.Error(w, "upstream no disponible", http.StatusBadGateway)
-		},
 	}
 
 	var ready atomic.Bool
@@ -119,10 +96,12 @@ func main() {
 		MaxRetries:            -1,
 	})
 	defer rdb.Close()
-	redisStore := ratelimit.NewRedisStore(rdb, cfg.App, cfg.Rate, cfg.Burst)
-	local := ratelimit.NewMemoryStore(cfg.Rate, cfg.Burst)
-
-	store := ratelimit.NewFailoverStore(redisStore, local, 50*time.Millisecond, 5, 10*time.Second, logger)
+	// Un store de rate limit POR APP (llaves gd:<app>:{ip}), reutilizado entre
+	// recargas mientras rate y burst no cambien: el circuit breaker y los
+	// buckets locales sobreviven a una recarga.
+	rates := ratelimit.NewPool(func(app string, rate float64, burst int) ratelimit.RateStore {
+		return ratelimit.NewRedisStore(rdb, app, rate, burst)
+	}, 50*time.Millisecond, 5, 10*time.Second, logger)
 
 	clientipResolver, err := clientip.New(cfg.TrustedProxies, cfg.XForwardedForHeader)
 	if err != nil {
@@ -149,72 +128,40 @@ func main() {
 	}
 	var repReader *reputation.Reader
 	if cfg.Reputation.Enabled {
-		repReader = reputation.NewReader(rdb, cfg.App, cfg.Reputation)
+		repReader = reputation.NewReader(rdb, cfg.Reputation) // uno para todas las apps
 	}
 	logger.Info("reputation", "enabled", cfg.Reputation.Enabled,
 		"min_distinct_ips", cfg.Reputation.MinDistinctIPs, "cache_ttl", cfg.Reputation.CacheTTL.String())
-	// La ACL de la Admin API (bloqueos y allowlist en Redis). Tiene caché, así
-	// que se crea UNA vez y la reutiliza cada cadena reconstruida, igual que
+	// La ACL de la Admin API (bloqueos y allowlist en Redis). Tiene caché y
+	// métricas, así que se crea UNA vez para TODAS las apps (la app viaja en
+	// cada llamada) y la reutiliza cada cadena reconstruida, igual que
 	// repReader. Con admin apagado queda nil y el middleware ACL no hace nada.
 	var aclStore *acl.Store
 	if cfg.Admin.Enabled {
 		opts := cfg.Admin.ACLOptions()
 		opts.Registerer = prometheus.DefaultRegisterer
-		aclStore = acl.New(rdb, cfg.App, opts)
+		aclStore = acl.New(rdb, opts)
 	}
-	tracer := otel.Tracer("github.com/fharias/guardian-scrapy")
-	step := func(name string, mw middleware.Middleware) middleware.Middleware {
-		return middleware.Traced(tracer, name, mw)
+	// Las piezas con estado, creadas una vez. chainDeps.build (build.go) arma
+	// con ellas una cadena por app en cada recarga; scorer, rules, modes,
+	// ja4Policy y el ReverseProxy de cada app se crean nuevos cada vez.
+	deps := &chainDeps{
+		logger:        logger,
+		tracer:        otel.Tracer("github.com/fharias/guardian-scrapy"),
+		trustIncoming: cfg.Tracing.TrustIncoming,
+		preserveHost:  cfg.PreserveHost,
+		clientip:      clientipResolver,
+		ja4Source:     ja4Source,
+		repReader:     repReader,
+		aclStore:      aclStore,
+		bots:          bots,
+		ch:            ch,
+		mets:          mets,
+		emitFor:       emitFor,
+		rates:         rates,
+		unknown:       misdirected(mets, logger),
 	}
-	// buildProtected arma la cadena COMPLETA con una config ya validada. Corre
-	// al arrancar y en cada recarga. Las piezas recargables (scorer, rules,
-	// modes, ja4Policy) se crean aquí, nuevas cada vez; las que cargan estado
-	// (store, repReader, aclStore, bots, ch, clientipResolver, ja4Source, proxy,
-	// mets) se crearon arriba una sola vez y se reutilizan.
-	buildProtected := func(c *config.Config, version string) (http.Handler, error) {
-		scorer, err := scoring.New(c.Scoring)
-		if err != nil {
-			return nil, fmt.Errorf("scoring: %w", err)
-		}
-		engine, err := rules.New(c.Rules)
-		if err != nil {
-			return nil, fmt.Errorf("rules: %w", err)
-		}
-		modes, err := policy.New(c.Modes)
-		if err != nil {
-			return nil, fmt.Errorf("modes: %w", err)
-		}
-		ja4Policy, err := fingerprint.NewJA4Policy(c.JA4)
-		if err != nil {
-			return nil, fmt.Errorf("ja4: %w", err)
-		}
-		return middleware.Chain(proxy,
-			middleware.Init,
-			middleware.ConfigVersion(version),
-			mets.Middleware(modes.Route),
-			emitFor(modes.Route),
-			middleware.Trace(tracer, middleware.TraceOptions{
-				Route: modes.Route,
-				TrustIncoming: func(r *http.Request) bool {
-					return cfg.Tracing.TrustIncoming && clientipResolver.PeerIsTrusted(r)
-				},
-			}),
-			step("clientip", middleware.ClientIP(clientipResolver)),
-			middleware.Logger(logger),
-			step("suspiciousua", middleware.SuspiciousUA()),
-			step("fingerprint", middleware.Fingerprint()),
-			step("ja4", middleware.JA4(ja4Source, logger)),
-			step("acl", middleware.ACL(aclStore, logger)),
-
-			step("ja4mismatch", middleware.JA4Mismatch(ja4Policy)),
-			step("reputation", middleware.Reputation(repReader, logger)),
-			step("rules", middleware.Rules(engine, bots, 300*time.Millisecond)),
-			step("ratelimit", middleware.RateLimit(store, logger)),
-			step("score", middleware.Score(scorer)),
-			step("enforce", middleware.Enforce(ch, modes, logger)),
-		), nil
-	}
-	reloader, err := configsource.New(src, cfg, cfgVersion, buildProtected, configsource.Options{
+	reloader, err := configsource.New(src, cfg, cfgVersion, deps.build, configsource.Options{
 		Logger:     logger,
 		Registerer: prometheus.DefaultRegisterer,
 	})
@@ -224,6 +171,8 @@ func main() {
 	}
 	logger.Info("config", "source", src.Name(), "version", cfgVersion,
 		"poll", poll.String(), "recargable", config.Reloadable)
+	logger.Info("apps", "multi_app", cfg.MultiApp(), "apps", reloader.Current().Value.Names(),
+		"default_app", reloader.Current().Value.Default())
 	protected := configsource.Handler(reloader)
 	adminSrv, err := newAdminServer(cfg, aclStore, reloader, logger)
 	if err != nil {
@@ -293,7 +242,7 @@ func main() {
 	}
 	logger.Info("tracing", "enabled", cfg.Tracing.Enabled, "endpoint", cfg.Tracing.Endpoint,
 		"sample_ratio", cfg.Tracing.SampleRatio, "trust_incoming", cfg.Tracing.TrustIncoming)
-	local.StartJanitor(ctx, time.Minute, logger)
+	rates.StartJanitor(ctx, time.Minute, logger)
 	defer stop()
 
 	// Recarga en caliente: fsnotify + poll dentro de Run; SIGHUP como disparador
@@ -423,7 +372,7 @@ func setupEvents(cfg events.Config, logger *slog.Logger) (func(context.Context) 
 // newAdminServer arma la Admin API si admin.enabled; si está apagada devuelve
 // nil. Sin un token válido en GUARDIAN_ADMIN_TOKEN devuelve error y main no
 // arranca: es preferible un deploy que falla a una API de bloqueos abierta.
-func newAdminServer(cfg *config.Config, store *acl.Store, reloader *configsource.Reloader[http.Handler], logger *slog.Logger) (*http.Server, error) {
+func newAdminServer(cfg *config.Config, store *acl.Store, reloader *configsource.Reloader[*apps.Router], logger *slog.Logger) (*http.Server, error) {
 	if !cfg.Admin.Enabled {
 		return nil, nil
 	}
@@ -432,7 +381,13 @@ func newAdminServer(cfg *config.Config, store *acl.Store, reloader *configsource
 		return nil, err
 	}
 	h, err := admin.NewHandler(admin.Options{
-		Store:      store,
+		Store: store,
+		// Las apps de la config VIGENTE: si una recarga agrega una app, la
+		// Admin API la acepta en el siguiente request.
+		Apps: func() ([]string, string) {
+			rt := reloader.Current().Value
+			return rt.Names(), rt.Default()
+		},
 		Tokens:     tokens,
 		MaxTTL:     cfg.Admin.MaxTTL,
 		Logger:     logger,
@@ -446,7 +401,10 @@ func newAdminServer(cfg *config.Config, store *acl.Store, reloader *configsource
 		},
 		Info: func() admin.ConfigInfo {
 			s := reloader.Current()
-			return admin.ConfigInfo{Version: s.Version, LoadedAt: s.LoadedAt, Reloadable: config.Reloadable}
+			return admin.ConfigInfo{
+				Version: s.Version, LoadedAt: s.LoadedAt, Reloadable: config.Reloadable,
+				Apps: s.Value.Names(), DefaultApp: s.Value.Default(),
+			}
 		},
 	})
 	if err != nil {

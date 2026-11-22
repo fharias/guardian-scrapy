@@ -10,6 +10,35 @@ Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición 
 
 `guardian` escucha HTTP en `:8080`. Con el bloque `tls` del ejemplo, también escucha HTTPS en `:8443`. Con `proxy_protocol` activo, cada listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. En HTTPS el orden es TCP, cabecera PROXY si aplica, captura del ClientHello y luego TLS 1.2 como mínimo. `GET /healthz`, `GET /readyz` y `POST /__guardian/verify` salen antes de la cadena protegida. El resto entra en esa cadena. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto. Con `tracing.enabled`, los spans de la cadena protegida salen por OTLP/HTTP.
 
+Sin la sección `apps`, el campo `app` es la única aplicación y atiende cualquier `Host`. Con `apps`, la resolución es la de `apps.Router`: un lookup del `Host` y la cadena de esa app. `cmd/guardian` todavía publica en `/` una sola cadena, armada con `app` y el upstream global. El snapshot de hoy no es ese router, así que un `Host` distinto sigue la misma cadena y `guardian_unknown_host_total` se queda en 0.
+
+```mermaid
+flowchart TD
+  req["request · Host API.local:8080"] --> mux[root mux]
+  mux --> fuera["/healthz, /readyz y /__guardian/verify"]
+  mux --> cur["configsource.Handler · reloader.Current()"]
+  cur --> norm["NormalizeHost → api.local"]
+  norm --> look["table.Lookup · un map hit"]
+  look --> shop[shop]
+  look --> api[api]
+  look --> nadie["Host sin app"]
+  shop --> cshop["cadena de shop · su store, scorer, modes y upstream"]
+  api --> capi["la misma cadena · objetos de api"]
+  nadie --> miss["421 Misdirected Request · guardian_unknown_host_total"]
+  nadie --> def["o la cadena de default_app"]
+```
+
+`NormalizeHost` quita el puerto, el punto final y pasa a minúsculas. `API.local:8080` queda en `api.local`. Si el `Host` ya viene en minúsculas, esa función no asigna memoria. Con mayúsculas, una sola copia. Un nombre de más de 253 caracteres no se busca. La precedencia es host exacto, después el comodín de sufijo más largo, después `default_app`. `*.shop.local` cubre `a.shop.local` y no cubre `shop.local`. El IDNA a punycode corre al cargar la config. El lookup del request no lo vuelve a hacer. Sin `default_app`, el cuerpo del 421 es `host desconocido` y `Cache-Control` es `no-store`. El contador no lleva el `Host`: lo escribe el cliente.
+
+Cada app hereda una sección entera del YAML superior cuando no la escribe. `scoring`, `rules` y `modes` no se mezclan campo a campo. `rate` y `burst` en 0 heredan. `upstream` vacío hereda. El nombre es `[a-z0-9-]`, empieza por letra o dígito y mide como máximo 32. Un host repetido, un comodín sobre una IP o un `default_app` que no está en `apps` fallan la carga. `apps` y `default_app` se recargan en caliente. El nombre de la app queda en `middleware.App`, justo después de `Init`, y de ahí lo leen el límite de tasa, la ACL, la reputación, las métricas, los eventos y el log. `internal/ratelimit.Pool` guarda un store por app y lo conserva entre recargas cuando `rate` y `burst` no cambian. El proceso de hoy crea un solo store con el `app` y el rate globales.
+
+```bash
+cd deploy/compose
+docker compose -f docker-compose.yml -f docker-compose.apps.yml up -d --build
+```
+
+Ese override usa `config/guardian.apps.yml`. `shop.local` y `*.shop.local` son `shop` y heredan el upstream, el rate y `enforce`. `api.local` es `api`, con upstream `http://upstream-api:9000`, 20 por segundo, burst 40, modo `monitor` y honeypots propios. No hay `default_app`. El archivo de Compose agrega el servicio `upstream-api`.
+
 ```mermaid
 flowchart LR
   cliente[Cliente o balanceador]
@@ -52,11 +81,11 @@ flowchart LR
   reverso --> origen
 ```
 
-La cadena se ejecuta en este orden. `ConfigVersion` deja en el veredicto el hash del archivo con el que se armó esta cadena. `Metrics` mide la petición al volver del resto. `Events` emite el veredicto ya cerrado, también al volver. `Trace` abre el span raíz, copia su `trace_id` al veredicto y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`.
+La cadena de cada app se ejecuta en este orden. `App` deja en el veredicto el nombre de la app dueña de esa cadena. `ConfigVersion` deja el hash del archivo con el que se armó. `Metrics` mide la petición al volver del resto. `Events` emite el veredicto ya cerrado, también al volver. `Trace` abre el span raíz, copia su `trace_id` al veredicto y lo cierra cuando la respuesta ya salió. `Logger` envuelve lo que sigue y escribe el veredicto al volver. Hasta `Score`, los middleware solo marcan señales. El puntaje y la decisión salen de `Score`. El límite de tasa, el scorer, los modos y el reverse proxy son los de esa app.
 
 ```mermaid
 flowchart TD
-  init[Init] --> ver[ConfigVersion] --> mets[Metrics] --> events[Events] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA]
+  init[Init] --> app[App] --> ver[ConfigVersion] --> mets[Metrics] --> events[Events] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA]
   ua --> fp[Fingerprint] --> ja4src[JA4] --> acl[ACL] --> ja4[JA4Mismatch] --> rep[Reputation] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
@@ -70,6 +99,7 @@ flowchart TD
 | ClientHello | `internal/tlshello` | Foto del saludo TLS, JA4 y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
 | Configuración | `internal/config` | Parseo, validación y la lista de campos que se pueden recargar |
+| Apps | `internal/apps` | Tabla de hosts, comodines y el 421 de un Host desconocido |
 | Fuente de config | `internal/configsource` | Lee el archivo, vigila el directorio y publica un snapshot inmutable por recarga |
 | IP del cliente | `internal/clientip` | Elige la IP real a partir del peer y de la cabecera configurada |
 | Huella | `internal/fingerprint` | Resume las cabeceras y compara el JA4 con herramientas conocidas |
@@ -266,7 +296,7 @@ flowchart TD
 
 Valkey guarda el bucket en `gd:<app>:{ip}:tokens` y `gd:<app>:{ip}:ts`. Si Valkey falla, la petición se resuelve en memoria. Tras 5 fallos seguidos el circuito queda abierto 10 segundos y todas las decisiones salen del limitador local. Esos saltos incrementan `guardian_fail_open_total` con el motivo `timeout`, `error` o `circuit_open`, y dejan un evento `fail_open` con ese `reason` en el span `mw.ratelimit`.
 
-El log de cada petición que entra en la cadena es JSON en stdout: `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos, duración y `config_version`. Si hubo un origen de JA4, suma `ja4` y `ja4_source`. En HTTPS suma también `tls_version` y `sni`. Si el span de la petición es válido, suma `trace_id`.
+El log de cada petición que entra en la cadena es JSON en stdout: `app`, `client_ip`, `mode`, `shadow`, `fingerprint`, método, ruta, score, decisión, motivos, duración y `config_version`. Si hubo un origen de JA4, suma `ja4` y `ja4_source`. En HTTPS suma también `tls_version` y `sni`. Si el span de la petición es válido, suma `trace_id`. El span guarda `guardian.app`.
 
 ### Trazas
 
@@ -300,7 +330,7 @@ flowchart TD
 
 `events.enabled` en falso no exige sal y el paso no emite nada. El ejemplo lo deja en verdadero, con sink `log` y un buffer de 1024. Un buffer 0 o ausente también vale 1024. Ese tamaño cabe cerca de un segundo a 1000 peticiones por segundo.
 
-El evento sale cuando la cadena protegida ya volvió. `/healthz`, `/readyz` y `POST /__guardian/verify` no lo generan. Lleva la hora UTC, `ip_hash`, `ja4`, `ja4_source`, `fingerprint`, `route`, `method`, `score`, `decision`, `reasons`, `mode`, `shadow` y `trace_id`. `route` es el mismo prefijo que usan las métricas. `method` es el de la petición, sin pasar por la normalización de Prometheus. Un modo vacío queda en `none`.
+El evento sale cuando la cadena protegida ya volvió. `/healthz`, `/readyz` y `POST /__guardian/verify` no lo generan. Lleva la hora UTC, `app`, `ip_hash`, `ja4`, `ja4_source`, `fingerprint`, `route`, `method`, `score`, `decision`, `reasons`, `mode`, `shadow` y `trace_id`. `app` es el nombre que dejó `middleware.App`. Si ese nombre no es válido, el aggregator cuenta el evento en el `app` de su propio YAML. `route` es el mismo prefijo que usan las métricas. `method` es el de la petición, sin pasar por la normalización de Prometheus. Un modo vacío queda en `none`.
 
 `ip_hash` es el HMAC-SHA256 de la IP, con `GUARDIAN_EVENT_SALT` como clave, recortado a 16 bytes y escrito en hexadecimal. La sal mide al menos 16 caracteres. Una IP inválida deja el campo vacío. Cambiar la sal deja de coincidir con los hashes anteriores. El evento no trae la IP. El log `request` sigue llevando `client_ip`.
 
@@ -370,12 +400,16 @@ Sin `Authorization: Bearer` válido la respuesta es `401`, con `WWW-Authenticate
 
 | Método | Ruta | Qué hace |
 | --- | --- | --- |
-| `GET` | `/v1/blocks` y `/v1/allowlist` | Lista las entradas vigentes |
+| `GET` | `/v1/apps` | Nombres de las apps y `default_app` |
+| `GET` | `/v1/blocks` y `/v1/allowlist` | Lista las entradas de la app por defecto. Sin `default_app`, `404` y la lista de apps |
+| `GET` | `/v1/apps/{app}/blocks` y `/v1/apps/{app}/allowlist` | La misma lista, de esa app. Un nombre que no existe es `404` |
 | `GET` | `/v1/blocks/{kind}/{value}` y `/v1/allowlist/{kind}/{value}` | Una entrada. `404` si no existe o ya expiró |
 | `PUT` | la misma ruta de una entrada | Crea o reemplaza. El cuerpo pide `ttl` y `reason` |
 | `DELETE` | la misma ruta de una entrada | `204` si la borró, `404` si no estaba |
 | `POST` | `/v1/reload` | La misma recarga que fsnotify y `SIGHUP`, con motivo `admin_api` |
 | `GET` | `/v1/config` | `version`, `loaded_at` y la lista `reloadable`. No devuelve valores del YAML |
+
+`GET`, `PUT` y `DELETE` de una entrada existen en `/v1/{lista}/{kind}/{value}` y en `/v1/apps/{app}/{lista}/{kind}/{value}`.
 
 `kind` es `ip` o `ja4`. La allowlist solo acepta `ip`. Un JA4 de allowlist responde `400`: ese JA4 lo comparte cualquiera con el mismo navegador. La IP se guarda sin zona y sin el prefijo IPv4-mapeado, así `::ffff:1.2.3.4` y `1.2.3.4` son la misma llave. El JA4 va en minúsculas y con la forma `10_12_12`.
 
@@ -416,6 +450,7 @@ internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
 internal/config/              parseo, validación y campos recargables
 internal/configsource/        archivo, fsnotify, poll, SIGHUP y snapshot de la cadena
+internal/apps/                tabla de hosts y 421
 internal/acl/                 bloqueos y allowlist en Valkey
 internal/admin/               Admin API: token, ACL y recarga
 internal/events/              evento del veredicto, HMAC de la IP, buffer, SQS, Kinesis y Kafka
@@ -660,7 +695,7 @@ La carga también rechaza la configuración cuando:
 
 ## Recarga en caliente
 
-`guardian` vigila el archivo de `-config` y, sin reiniciar, vuelve a armar la cadena protegida cuando cambian `scoring`, `rules`, `modes` o `ja4.tools`. Cada request lee el snapshot una vez al entrar y lo usa hasta el final. `POST /__guardian/verify` y el aggregator quedan con la config de arranque.
+`guardian` vigila el archivo de `-config` y, sin reiniciar, vuelve a armar la cadena protegida cuando cambian `scoring`, `rules`, `modes`, `ja4.tools`, `apps` o `default_app`. Cada request lee el snapshot una vez al entrar y lo usa hasta el final. `POST /__guardian/verify` y el aggregator quedan con la config de arranque.
 
 En cada recarga se reconstruyen el scorer, las reglas, los modos y la política de JA4. El resto se creó al arrancar y se reutiliza: listeners, TLS, upstream, Valkey, el límite de tasa, el desafío, los bots, el origen del JA4, la reputación, la ACL, los eventos y las trazas.
 
@@ -672,7 +707,7 @@ En cada recarga se reconstruyen el scorer, las reglas, los modos y la política 
 - La versión son los primeros 12 hexadecimales del SHA-256 de los bytes del archivo. `guardian_config_info` y el campo `config_version` del log `request` de la cadena protegida muestran ese valor. El log de `POST /__guardian/verify` no lo lleva.
 - La config nueva se parsea y se mezcla con lo que quedó fijo al arrancar. Esa mezcla se valida y la cadena se construye entera antes de publicarse. Si algo falla, sigue la anterior, `guardian_config_last_reload_successful` pasa a 0 y el log dice `config_recarga_fallida`. Un poll posterior del mismo archivo rechazado no repite ese error. Un fallo al arrancar termina el proceso, porque todavía no hay config anterior.
 - Bajar `scoring.weights.ja4_reputation` a 0 mientras `reputation.enabled` quedó en verdadero al arrancar no se aplica: la mezcla no pasa la validación.
-- Un cambio fuera de esos cuatro bloques (`listen`, `tls`, `upstream`, timeouts, `redis_addr`, `rate`, `burst`, `trusted_proxies`, `ja4.source`, `challenge`, `good_bots`, `events`, `tracing`, `reputation`, `admin`) deja el warning `config_requiere_reinicio` y el proceso sigue con el valor de arranque. Si el archivo igual es válido, la versión avanza, porque el hash es el del archivo. En el diff del log, un campo cuyo nombre contiene `password`, `secret`, `token` o `key_file` sale como `***`.
+- Un cambio fuera de esos bloques (`listen`, `tls`, `upstream`, timeouts, `redis_addr`, `rate`, `burst`, `trusted_proxies`, `ja4.source`, `challenge`, `good_bots`, `events`, `tracing`, `reputation`, `admin`) deja el warning `config_requiere_reinicio` y el proceso sigue con el valor de arranque. Si el archivo igual es válido, la versión avanza, porque el hash es el del archivo. En el diff del log, un campo cuyo nombre contiene `password`, `secret`, `token` o `key_file` sale como `***`. Las apps se comparan por nombre: reordenar el YAML no es un cambio.
 - Una recarga aplicada deja la línea `config_recargada` con la versión anterior, la nueva, el motivo, los cambios y `dur_ms`. Las series `ok` y `error` de `guardian_config_reloads_total` existen desde el arranque.
 
 | Métrica | Tipo | Qué dice |
@@ -716,11 +751,12 @@ El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPT
 
 | Métrica | Tipo | Labels | Qué cuenta |
 | --- | --- | --- | --- |
-| `guardian_http_requests_total` | counter | `route`, `method`, `code` | Peticiones que salen de la cadena protegida |
-| `guardian_http_request_duration_seconds` | histogram | `route`, `method` | Tiempo dentro de guardian, incluido el upstream. Buckets: 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 2.5 s y 5 s |
+| `guardian_http_requests_total` | counter | `app`, `route`, `method`, `code` | Peticiones que salen de la cadena protegida. Sin `middleware.App`, `app` queda en `none` |
+| `guardian_http_request_duration_seconds` | histogram | `app`, `route`, `method` | Tiempo dentro de guardian, incluido el upstream. Buckets: 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 2.5 s y 5 s |
 | `guardian_http_requests_in_flight` | gauge | — | Peticiones que aún no han vuelto del resto de la cadena |
-| `guardian_decisions_total` | counter | `decision`, `mode`, `shadow` | Decisión leída del veredicto. `shadow` vale `true` o `false`. Un modo vacío queda en `none` |
-| `guardian_signals_total` | counter | `reason` | Cada motivo que el veredicto trae en `Reasons` |
+| `guardian_decisions_total` | counter | `app`, `decision`, `mode`, `shadow` | Decisión leída del veredicto. `shadow` vale `true` o `false`. Un modo vacío queda en `none` |
+| `guardian_signals_total` | counter | `app`, `reason` | Cada motivo que el veredicto trae en `Reasons` |
+| `guardian_unknown_host_total` | counter | — | Hosts que `apps.Router` responde con 421. El binario de hoy no lo incrementa |
 | `guardian_fail_open_total` | counter | `reason` | Saltos al limitador en memoria: `timeout`, `error` o `circuit_open` |
 | `guardian_events_enqueued_total` | counter | — | Eventos que entraron al buffer |
 | `guardian_events_dropped_total` | counter | `reason` | Descartados: `buffer_full` o `closed`. Las dos series existen desde el arranque |
@@ -737,7 +773,7 @@ El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPT
 | `guardian_admin_requests_total` | counter | `route`, `code` | Requests de la Admin API. `route` es el patrón, o `unauthorized` en un `401` |
 | `guardian_admin_request_duration_seconds` | histogram | `route` | Latencia de la Admin API. Buckets: 1 ms, 5 ms, 10 ms, 50 ms, 100 ms, 500 ms, 1 s y 5 s |
 | `guardian_admin_auth_failures_total` | counter | — | `401` de la Admin API |
-| `guardian_admin_changes_total` | counter | `action`, `list`, `kind`, `result` | Altas, bajas y recargas, con el resultado |
+| `guardian_admin_changes_total` | counter | `action`, `app`, `list`, `kind`, `result` | Altas, bajas y recargas, con el resultado |
 
 ## Ejecutar
 
@@ -910,17 +946,15 @@ awsl sqs list-queues
 awsl kinesis list-streams
 ```
 
-`deploy/compose/prometheus/alerts.yml` define siete alertas del job `guardian`:
+`deploy/compose/prometheus/alerts.yml` define cinco alertas del job `guardian`:
 
 | Alerta | Condición | Durante | Severidad |
 | --- | --- | --- | --- |
 | `GuardianDown` | `up == 0` | 1 minuto | `critical` |
-| `GuardianHighErrorRate` | más del 5 % de los requests en 5xx | 5 minutos | `critical` |
+| `GuardianHighErrorRate` | más del 5 % de los requests en 5xx de una misma `app` | 5 minutos | `critical` |
 | `GuardianHighLatencyP99` | p99 por encima de 500 ms | 10 minutos | `warning` |
 | `GuardianFailOpen` | algún `guardian_fail_open_total` en la ventana de 5 minutos | 2 minutos | `warning` |
 | `GuardianConfigReloadFailing` | `guardian_config_last_reload_successful == 0` | 5 minutos | `warning` |
-| `GuardianAdminAuthFailures` | más de 20 `401` de la Admin API en 10 minutos | al momento | `warning` |
-| `GuardianACLLookupErrors` | algún `guardian_acl_lookup_errors_total` en la ventana de 5 minutos | 5 minutos | `warning` |
 
 `alerts_test.yml` es la prueba de `promtool` y Prometheus no la carga. Se corre desde `deploy/compose/prometheus`:
 
