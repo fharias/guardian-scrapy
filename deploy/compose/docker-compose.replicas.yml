@@ -1,0 +1,32 @@
+# Override con una SEGUNDA réplica de guardian para probar que un bloqueo hecho
+# en la Admin API de una réplica se aplica en la otra (vía Valkey).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.kafka.yml \
+#                  -f docker-compose.replicas.yml up -d --build
+#
+# guardian   -> proxy 127.0.0.1:8080, admin 127.0.0.1:9091
+# guardian-b -> proxy 127.0.0.1:8081, admin 127.0.0.1:9191
+#
+# Mismo binario, mismo directorio de config, mismo Valkey, mismas llaves HMAC
+# (un pase emitido por una réplica vale en la otra). Lo ÚNICO compartido entre
+# las dos en tiempo de ejecución es Valkey: no se hablan entre sí.
+services:
+  guardian-b:
+    image: guardian:dev          # la construye el servicio guardian
+    command: ["-config", "/etc/guardian/guardian.kafka.yml"]
+    environment:
+      GUARDIAN_PASS_KEYS: ${GUARDIAN_PASS_KEYS:?define GUARDIAN_PASS_KEYS en deploy/compose/.env}
+      GUARDIAN_EVENT_SALT: ${GUARDIAN_EVENT_SALT:?define GUARDIAN_EVENT_SALT en deploy/compose/.env}
+      GUARDIAN_ADMIN_TOKEN: ${GUARDIAN_ADMIN_TOKEN:?define GUARDIAN_ADMIN_TOKEN en deploy/compose/.env}
+    volumes:
+      - ./config:/etc/guardian:ro
+    ports:
+      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:9191:9091"
+    depends_on:
+      guardian: { condition: service_started }
+      valkey: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]

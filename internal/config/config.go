@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"time"
 
+	"github.com/fharias/guardian-scrapy/internal/admin"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/events"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
@@ -55,6 +57,7 @@ type Config struct {
 	Tracing             tracing.Config        `yaml:"tracing"`
 	Events              events.Config         `yaml:"events"`
 	Reputation          reputation.Config     `yaml:"reputation"`
+	Admin               admin.Config          `yaml:"admin"`
 	UpstreamURL         *url.URL              `yaml:"-"`
 }
 
@@ -128,6 +131,7 @@ func Parse(data []byte) (*Config, error) {
 	}
 	cfg.Events = cfg.Events.WithDefaults()
 	cfg.Reputation = cfg.Reputation.WithDefaults()
+	cfg.Admin = cfg.Admin.WithDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("config inválida: %w", err)
 	}
@@ -209,5 +213,23 @@ func (c *Config) validate() error {
 	if c.Reputation.Enabled && c.Scoring.Weights.JA4Reputation <= 0 {
 		errs = append(errs, errors.New("reputation.enabled es true pero scoring.weights.ja4_reputation es 0: la señal se calcularía y nunca sumaría"))
 	}
+	if err := c.Admin.Validate(); err != nil {
+		errs = append(errs, err)
+	}
+	if c.Admin.Enabled {
+		for _, other := range []string{c.Listen, c.TLS.Listen, ":2112"} {
+			if other != "" && samePort(c.Admin.Listen, other) {
+				errs = append(errs, fmt.Errorf("admin.listen (%s) choca con %s: la Admin API va en su propio puerto", c.Admin.Listen, other))
+			}
+		}
+	}
 	return errors.Join(errs...)
+}
+
+// samePort compara solo el puerto: "127.0.0.1:8080" y ":8080" chocan, porque
+// ":8080" escucha en todas las interfaces, incluida 127.0.0.1.
+func samePort(a, b string) bool {
+	_, pa, errA := net.SplitHostPort(a)
+	_, pb, errB := net.SplitHostPort(b)
+	return errA == nil && errB == nil && pa == pb
 }

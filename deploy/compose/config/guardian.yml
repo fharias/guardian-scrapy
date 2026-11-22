@@ -79,3 +79,14 @@ events:
   enabled: true
   sink: log
   buffer: 1024
+admin:
+  enabled: true
+  # Dentro del contenedor escucha en todas sus interfaces; docker-compose.yml
+  # lo publica SOLO en 127.0.0.1 de tu Mac. En AWS: sin listener en el NLB,
+  # security group que solo deja entrar desde la VPN o el bastión.
+  listen: ":9091"
+  max_ttl: 168h            # un bloqueo dura máximo 7 días; lo permanente va en rules.deny_cidrs
+  cache_ttl: 2s            # atraso máximo con que OTRA réplica ve un bloqueo nuevo
+  stale_ttl: 1m            # si Valkey falla, cuánto sigue valiendo lo que ya leímos
+  lookup_timeout: 20ms     # presupuesto del GET por request
+  # El token NO va aquí: sale de GUARDIAN_ADMIN_TOKEN (deploy/compose/.env).

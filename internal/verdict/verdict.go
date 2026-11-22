@@ -36,6 +36,7 @@ type Signals struct {
 	VerifiedBot       bool
 	JA4Mismatch       bool
 	JA4Reputation     bool
+	Allowlisted       bool // la IP está en la allowlist de la Admin API
 }
 
 type Verdict struct {

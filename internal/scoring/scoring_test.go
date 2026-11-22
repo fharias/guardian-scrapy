@@ -35,6 +35,8 @@ func TestEvaluate(t *testing.T) {
 		decision verdict.Decision
 	}{
 		{"lista negra gana a todo", verdict.Signals{DenyReason: "ip_denegada", VerifiedBot: true}, 85, []string{"ip_denegada"}, verdict.Block},
+		{"allowlist salta la heurística", verdict.Signals{Allowlisted: true, UATool: true, HeadersIncomplete: true}, 0, []string{"allowlist_admin"}, verdict.Allow},
+		{"bloqueo manual gana a la allowlist", verdict.Signals{DenyReason: "bloqueo_admin_ja4", Allowlisted: true}, 85, []string{"bloqueo_admin_ja4"}, verdict.Block},
 		{"bot verificado pasa aunque visite honeypot", verdict.Signals{VerifiedBot: true, Honeypot: true}, 0, []string{"bot_verificado"}, verdict.Allow},
 		{"googlebot falso bloquea", verdict.Signals{FakeBot: true}, 90, []string{"bot_falso"}, verdict.Block},
 		{"humano limpio", verdict.Signals{}, 0, nil, verdict.Allow},

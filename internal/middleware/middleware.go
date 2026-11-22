@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fharias/guardian-scrapy/internal/acl"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 	"github.com/fharias/guardian-scrapy/internal/goodbot"
@@ -233,7 +234,10 @@ func Rules(e *rules.Engine, bots *goodbot.Verifier, dnsTimeout time.Duration) Mi
 				return
 			}
 
-			v.Signals.DenyReason = e.DenyReason(v.ClientIP, r.URL.Path)
+			// Si un middleware anterior (ACL) ya puso una negación dura, no la pisamos.
+			if v.Signals.DenyReason == "" {
+				v.Signals.DenyReason = e.DenyReason(v.ClientIP, r.URL.Path)
+			}
 			v.Signals.Honeypot = e.IsHoneypot(r.URL.Path)
 
 			ctx, cancel := context.WithTimeout(r.Context(), dnsTimeout)
@@ -259,6 +263,32 @@ func Reputation(rep *reputation.Reader, log *slog.Logger) Middleware {
 					log.Warn("reputation no disponible", "err", err)
 				}
 				v.Signals.JA4Reputation = bad
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ACL consulta los bloqueos y la allowlist de la Admin API (en Redis, con caché
+// local) y solo deja señales: un bloqueo va a DenyReason (negación dura, el
+// scorer devuelve Block y Enforce lo aplica aunque la ruta esté en monitor) y
+// la allowlist a Signals.Allowlisted. Decide el scorer, como con todo lo demás.
+// Va apenas se conocen la IP y el JA4 (después de ClientIP y JA4).
+func ACL(store *acl.Store, log *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		if store == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil {
+				m, err := store.Check(r.Context(), v.ClientIP, v.JA4)
+				if err != nil {
+					log.Warn("acl no disponible", "err", err)
+				}
+				if m.Block != nil && v.Signals.DenyReason == "" {
+					v.Signals.DenyReason = m.Block.SignalReason()
+				}
+				v.Signals.Allowlisted = m.Allow != nil
 			}
 			next.ServeHTTP(w, r)
 		})

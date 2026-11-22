@@ -64,6 +64,7 @@ services:
     environment:
       GUARDIAN_PASS_KEYS: ${GUARDIAN_PASS_KEYS:?define GUARDIAN_PASS_KEYS en deploy/compose/.env}
       GUARDIAN_EVENT_SALT: ${GUARDIAN_EVENT_SALT:?define GUARDIAN_EVENT_SALT en deploy/compose/.env}
+      GUARDIAN_ADMIN_TOKEN: ${GUARDIAN_ADMIN_TOKEN:?define GUARDIAN_ADMIN_TOKEN en deploy/compose/.env}
     volumes:
       # Se monta el DIRECTORIO, no el archivo. Un bind mount de un archivo suelto
       # queda pegado al inode original: cuando tu editor guarda con "atomic save"
@@ -72,6 +73,7 @@ services:
       - ./config:/etc/guardian:ro
     ports:
       - "127.0.0.1:8080:8080"   # el 2112 NO se publica
+      - "127.0.0.1:9091:9091"   # Admin API: solo tu laptop, nunca 0.0.0.0
     depends_on:
       valkey: { condition: service_healthy }
       upstream: { condition: service_started }

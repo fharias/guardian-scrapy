@@ -59,6 +59,12 @@ func (s *Scorer) Evaluate(sig verdict.Signals) (int, []string, verdict.Decision)
 	if sig.DenyReason != "" {
 		return s.cfg.Thresholds.Block, []string{sig.DenyReason}, verdict.Block
 	}
+	// La allowlist salta la heurística, pero va DESPUÉS de DenyReason: una
+	// negación dura (bloqueo de la Admin API, deny_cidrs, ruta privada) gana
+	// siempre, igual que un Deny explícito en IAM.
+	if sig.Allowlisted {
+		return 0, []string{"allowlist_admin"}, verdict.Allow
+	}
 	if sig.VerifiedBot {
 		return 0, []string{"bot_verificado"}, verdict.Allow
 	}

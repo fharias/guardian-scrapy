@@ -23,6 +23,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/fharias/guardian-scrapy/internal/acl"
+	"github.com/fharias/guardian-scrapy/internal/admin"
 	"github.com/fharias/guardian-scrapy/internal/challenge"
 	"github.com/fharias/guardian-scrapy/internal/clientip"
 	"github.com/fharias/guardian-scrapy/internal/config"
@@ -151,6 +153,15 @@ func main() {
 	}
 	logger.Info("reputation", "enabled", cfg.Reputation.Enabled,
 		"min_distinct_ips", cfg.Reputation.MinDistinctIPs, "cache_ttl", cfg.Reputation.CacheTTL.String())
+	// La ACL de la Admin API (bloqueos y allowlist en Redis). Tiene caché, así
+	// que se crea UNA vez y la reutiliza cada cadena reconstruida, igual que
+	// repReader. Con admin apagado queda nil y el middleware ACL no hace nada.
+	var aclStore *acl.Store
+	if cfg.Admin.Enabled {
+		opts := cfg.Admin.ACLOptions()
+		opts.Registerer = prometheus.DefaultRegisterer
+		aclStore = acl.New(rdb, cfg.App, opts)
+	}
 	tracer := otel.Tracer("github.com/fharias/guardian-scrapy")
 	step := func(name string, mw middleware.Middleware) middleware.Middleware {
 		return middleware.Traced(tracer, name, mw)
@@ -158,8 +169,8 @@ func main() {
 	// buildProtected arma la cadena COMPLETA con una config ya validada. Corre
 	// al arrancar y en cada recarga. Las piezas recargables (scorer, rules,
 	// modes, ja4Policy) se crean aquí, nuevas cada vez; las que cargan estado
-	// (store, repReader, bots, ch, clientipResolver, ja4Source, proxy, mets)
-	// se crearon arriba una sola vez y se reutilizan.
+	// (store, repReader, aclStore, bots, ch, clientipResolver, ja4Source, proxy,
+	// mets) se crearon arriba una sola vez y se reutilizan.
 	buildProtected := func(c *config.Config, version string) (http.Handler, error) {
 		scorer, err := scoring.New(c.Scoring)
 		if err != nil {
@@ -193,6 +204,7 @@ func main() {
 			step("suspiciousua", middleware.SuspiciousUA()),
 			step("fingerprint", middleware.Fingerprint()),
 			step("ja4", middleware.JA4(ja4Source, logger)),
+			step("acl", middleware.ACL(aclStore, logger)),
 
 			step("ja4mismatch", middleware.JA4Mismatch(ja4Policy)),
 			step("reputation", middleware.Reputation(repReader, logger)),
@@ -213,6 +225,11 @@ func main() {
 	logger.Info("config", "source", src.Name(), "version", cfgVersion,
 		"poll", poll.String(), "recargable", config.Reloadable)
 	protected := configsource.Handler(reloader)
+	adminSrv, err := newAdminServer(cfg, aclStore, reloader, logger)
+	if err != nil {
+		logger.Error("admin", "err", err)
+		os.Exit(1)
+	}
 	verify := middleware.Chain(middleware.VerifyHandler(ch, logger),
 		middleware.Init,
 		middleware.ClientIP(clientipResolver),
@@ -309,6 +326,26 @@ func main() {
 		}
 	}()
 
+	if adminSrv != nil {
+		// net.Listen directo, SIN abrirListener: la Admin API no va detrás del
+		// NLB, así que no habla Proxy Protocol, y RemoteAddr es el operador real.
+		adminLn, err := net.Listen("tcp", adminSrv.Addr)
+		if err != nil {
+			logger.Error("no pude escuchar la Admin API", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("admin", "enabled", true, "addr", adminSrv.Addr,
+			"max_ttl", cfg.Admin.MaxTTL.String(), "cache_ttl", cfg.Admin.CacheTTL.String(),
+			"stale_ttl", cfg.Admin.StaleTTL.String())
+		go func() {
+			if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("servidor admin", "err", err)
+			}
+		}()
+	} else {
+		logger.Info("admin", "enabled", false)
+	}
+
 	if tlsSrv != nil {
 		tlsLn, err := abrirListener(cfg.TLS.Listen)
 		if err != nil {
@@ -337,6 +374,11 @@ func main() {
 	if tlsSrv != nil {
 		if err := tlsSrv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("apagado forzado: %v", err)
+		}
+	}
+	if adminSrv != nil {
+		if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("admin: apagado forzado: %v", err)
 		}
 	}
 	if err := closeEvents(shutdownCtx); err != nil {
@@ -375,5 +417,48 @@ func setupEvents(cfg events.Config, logger *slog.Logger) (func(context.Context) 
 		"batch_size", eff.BatchSize, "flush_interval", eff.FlushInterval.String())
 	return async.Close, func(route events.RouteFunc) middleware.Middleware {
 		return events.Middleware(async, hasher, route)
+	}, nil
+}
+
+// newAdminServer arma la Admin API si admin.enabled; si está apagada devuelve
+// nil. Sin un token válido en GUARDIAN_ADMIN_TOKEN devuelve error y main no
+// arranca: es preferible un deploy que falla a una API de bloqueos abierta.
+func newAdminServer(cfg *config.Config, store *acl.Store, reloader *configsource.Reloader[http.Handler], logger *slog.Logger) (*http.Server, error) {
+	if !cfg.Admin.Enabled {
+		return nil, nil
+	}
+	tokens, err := admin.ParseTokens(os.Getenv(admin.TokenEnv))
+	if err != nil {
+		return nil, err
+	}
+	h, err := admin.NewHandler(admin.Options{
+		Store:      store,
+		Tokens:     tokens,
+		MaxTTL:     cfg.Admin.MaxTTL,
+		Logger:     logger,
+		Registerer: prometheus.DefaultRegisterer,
+		// POST /v1/reload usa el MISMO Reloader que fsnotify y SIGHUP: misma
+		// validación en tres capas, mismo mutex, mismas métricas.
+		Reload: func(ctx context.Context) (string, string, error) {
+			before := reloader.Current().Version
+			err := reloader.Reload(ctx, "admin_api")
+			return before, reloader.Current().Version, err
+		},
+		Info: func() admin.ConfigInfo {
+			s := reloader.Current()
+			return admin.ConfigInfo{Version: s.Version, LoadedAt: s.LoadedAt, Reloadable: config.Reloadable}
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Server{
+		Addr:              cfg.Admin.Listen,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}, nil
 }
