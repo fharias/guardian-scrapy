@@ -51,3 +51,32 @@ tests:
       - eval_time: 10m
         alertname: GuardianConfigReloadFailing
         exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      # 5 intentos fallidos por minuto desde el minuto 1: en 10 min son 50.
+      - series: 'guardian_admin_auth_failures_total{job="guardian"}'
+        values: '0 0+5x15'
+      # Valkey falla del minuto 2 al 12 (el contador sube), luego se recupera.
+      - series: 'guardian_acl_lookup_errors_total{job="guardian"}'
+        values: '0 0 0+30x10 300x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GuardianAdminAuthFailures
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: GuardianAdminAuthFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: { summary: "Más de 20 requests sin token válido a la Admin API en 10 minutos: alguien está probando tokens" }
+      - eval_time: 4m
+        alertname: GuardianACLLookupErrors
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: GuardianACLLookupErrors
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: { summary: "guardian no puede leer los bloqueos de la Admin API en Valkey (fail-open): los bloqueos nuevos no se están aplicando" }
+      - eval_time: 20m
+        alertname: GuardianACLLookupErrors
+        exp_alerts: []

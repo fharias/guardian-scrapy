@@ -57,7 +57,7 @@ La cadena se ejecuta en este orden. `ConfigVersion` deja en el veredicto el hash
 ```mermaid
 flowchart TD
   init[Init] --> ver[ConfigVersion] --> mets[Metrics] --> events[Events] --> trace[Trace] --> ip[ClientIP] --> logger[Logger] --> ua[SuspiciousUA]
-  ua --> fp[Fingerprint] --> ja4src[JA4] --> ja4[JA4Mismatch] --> rep[Reputation] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
+  ua --> fp[Fingerprint] --> ja4src[JA4] --> acl[ACL] --> ja4[JA4Mismatch] --> rep[Reputation] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
 | Pieza | Paquete | Qué hace |
@@ -65,6 +65,8 @@ flowchart TD
 | Proxy y servidores | `cmd/guardian` | YAML con recarga en caliente, HTTP, HTTPS, PROXY protocol, métricas, trazas, Valkey y apagado |
 | Agregador | `cmd/aggregator` | Lee SQS o Kafka, cuenta IPs distintas por JA4 y marca la reputación en Valkey |
 | Reputación | `internal/reputation` | HyperLogLog por JA4 y la marca que el proxy consulta |
+| ACL | `internal/acl` | Bloqueos y allowlist de la Admin API en Valkey, con caché local |
+| Admin API | `internal/admin` | HTTP interno con token para escribir la ACL y pedir una recarga |
 | ClientHello | `internal/tlshello` | Foto del saludo TLS, JA4 y una línea `tls_hello` por conexión |
 | Upstream de prueba | `cmd/upstream` | Respuesta en texto. `/lento` espera 10 segundos |
 | Configuración | `internal/config` | Parseo, validación y la lista de campos que se pueden recargar |
@@ -169,9 +171,11 @@ Si las tres cosas cierran, la señal es bot verificado. Si el user-agent reclama
 
 ```mermaid
 flowchart TD
-  sig[Senales] --> deny{Hay ip_denegada o ruta_privada}
+  sig[Senales] --> deny{DenyReason}
   deny -->|si| block["block, score igual al umbral"]
-  deny -->|no| verified{Bot verificado}
+  deny -->|no| lista{IP en la allowlist}
+  lista -->|si| allowA["allow, score 0, allowlist_admin"]
+  lista -->|no| verified{Bot verificado}
   verified -->|si| allow["allow, score 0, bot_verificado"]
   verified -->|no| suma[Sumar los pesos activos]
   suma --> umbral{Score}
@@ -192,8 +196,10 @@ Con el YAML de ejemplo los pesos y los umbrales son estos:
 | User-Agent de navegador con un JA4 de `ja4.tools` | 60 | `ja4_incoherente` | `challenge` |
 | JA4 marcado con mala reputación | 0 en `guardian-config.yml`; 50 en `guardian.sqs.yml` | `ja4_reputacion` | `allow` con peso 0. Con 50 puntos, `challenge` |
 | Ratio de navegador por debajo de `browser_ratio_min` | 15 | `ratio_navegador_bajo` | `allow` |
+| IP o JA4 en la lista `block` de la Admin API | el umbral de `block` | `bloqueo_admin_ip` o `bloqueo_admin_ja4` | `block`, también en `monitor` |
+| IP en la lista `allow` de la Admin API | 0 | `allowlist_admin` | `allow` |
 
-`ip_denegada` y `ruta_privada` no suman un peso: el score queda en el umbral de `block` y la decisión es `block`, también si el bot estaba verificado. Un bot verificado, sin esas denegaciones, queda en `allow` con score 0 aunque haya visitado un honeypot.
+`ip_denegada`, `ruta_privada`, `bloqueo_admin_ip` y `bloqueo_admin_ja4` no suman un peso: el score queda en el umbral de `block` y la decisión es `block`, también si el bot estaba verificado o la IP está en la allowlist. Una IP en la allowlist, sin esas denegaciones, queda en `allow` con score 0 y el motivo `allowlist_admin`. Un bot verificado, sin denegación ni allowlist, queda en `allow` con score 0 aunque haya visitado un honeypot.
 
 `Enforce` mira el modo de la ruta antes de actuar. El modo es el de `modes.routes` cuyo prefijo es el más largo y coincide con la ruta. Si ninguno coincide, usa `modes.default`. Un prefijo coincide cuando la ruta es igual o continúa con `/`. `/api` cubre `/api` y `/api/precios`, y no cubre `/apiv2`. `/api/checkout` gana sobre `/api` en `/api/checkout/pagar`.
 
@@ -279,6 +285,7 @@ flowchart TD
   root --> b[mw.suspiciousua]
   root --> c[mw.fingerprint]
   root --> d[mw.ja4]
+  root --> acl[mw.acl]
   root --> e[mw.ja4mismatch]
   root --> r[mw.reputation]
   root --> f[mw.rules]
@@ -347,6 +354,52 @@ Si las IPs distintas de la ventana llegan a `min_distinct_ips` (50 por defecto),
 
 En la cadena protegida, `Reputation` va después de `JA4Mismatch`. Si el veredicto trae JA4, hace un `GET` de esa marca con tope `lookup_timeout` (20 ms). Un valor presente marca `JA4Reputation` y el scorer suma `ja4_reputacion`. Una clave ausente deja la señal en falso. Un error de Valkey también la deja en falso, escribe `reputation no disponible` y no guarda esa respuesta: el siguiente request vuelve a preguntar. Las respuestas buenas y las ausencias se cachean `cache_ttl` (10 segundos), hasta 10 000 JA4; al pasar de ese tope la caché se vacía. `POST /__guardian/verify` no consulta la reputación.
 
+### Admin API
+
+`admin.enabled` en falso no abre el puerto y el paso `ACL` deja pasar el request. El `guardian-config.yml` de la raíz lo deja apagado. Los YAML de `deploy/compose/config` lo encienden en `:9091`. El bloque entero pide reinicio: el listener y el store se crean una vez.
+
+El token sale solo de `GUARDIAN_ADMIN_TOKEN`. No hay campo de token en el YAML: un campo `token` es desconocido y el arranque falla. Hacen falta uno o dos tokens separados por coma, cada uno de al menos 32 caracteres. Dos sirven para rotar: se despliega `nuevo,viejo`, los clientes pasan al nuevo y después queda solo el nuevo. Guardian guarda el SHA-256, compara en tiempo constante y el log escribe `Tokens(n, redactados)`.
+
+```bash
+export GUARDIAN_ADMIN_TOKEN="$(openssl rand -hex 32)"
+```
+
+La API escucha en su propio proceso HTTP. `ReadHeaderTimeout` es 5 segundos, lectura y escritura 10 segundos, idle 60 segundos y el tope de cabeceras es 16 KiB. `admin.listen` vacío queda en `127.0.0.1:9091`. El puerto no puede coincidir con `listen`, `tls.listen` ni `:2112`. En Compose el proceso escucha en `:9091` dentro del contenedor y el host lo ve solo en `127.0.0.1:9091`. El apagado de esa API entra en el mismo `Shutdown` que HTTP y HTTPS.
+
+Sin `Authorization: Bearer` válido la respuesta es `401`, con `WWW-Authenticate` y el cuerpo `no autorizado`, antes de mirar si la ruta existe. El log deja `admin_auth_fallida` con el motivo `sin_bearer` o `token_invalido` y no escribe el header. `X-Guardian-Actor` es una etiqueta del audit log, con tope de 64 caracteres. Vacío queda en `desconocido`. No autentica a nadie.
+
+| Método | Ruta | Qué hace |
+| --- | --- | --- |
+| `GET` | `/v1/blocks` y `/v1/allowlist` | Lista las entradas vigentes |
+| `GET` | `/v1/blocks/{kind}/{value}` y `/v1/allowlist/{kind}/{value}` | Una entrada. `404` si no existe o ya expiró |
+| `PUT` | la misma ruta de una entrada | Crea o reemplaza. El cuerpo pide `ttl` y `reason` |
+| `DELETE` | la misma ruta de una entrada | `204` si la borró, `404` si no estaba |
+| `POST` | `/v1/reload` | La misma recarga que fsnotify y `SIGHUP`, con motivo `admin_api` |
+| `GET` | `/v1/config` | `version`, `loaded_at` y la lista `reloadable`. No devuelve valores del YAML |
+
+`kind` es `ip` o `ja4`. La allowlist solo acepta `ip`. Un JA4 de allowlist responde `400`: ese JA4 lo comparte cualquiera con el mismo navegador. La IP se guarda sin zona y sin el prefijo IPv4-mapeado, así `::ffff:1.2.3.4` y `1.2.3.4` son la misma llave. El JA4 va en minúsculas y con la forma `10_12_12`.
+
+El `PUT` exige un JSON de hasta 4 KiB, sin campos de más. `ttl` es una duración de Go mayor que 0 y como máximo `admin.max_ttl` (168 horas). Lo permanente va en `rules.deny_cidrs`. `reason` es obligatorio y de hasta 200 caracteres. Ese texto queda en el audit log `admin_audit`. La señal del request es fija: `bloqueo_admin_ip`, `bloqueo_admin_ja4` o `allowlist_admin`. El texto libre no entra en `guardian_signals_total`.
+
+Valkey guarda cada entrada en `gd:<app>:acl:<lista>:<kind>:<valor>` y la borra sola con el TTL. El listado usa el ZSET `gd:<app>:acl:index:<lista>`, con el vencimiento en el score. Las llaves no llevan hash tag: en un cluster se reparten entre los slots. El `PUT` escribe la entrada y el índice en un pipeline. Si el proceso cae entre los dos comandos, `List` ignora un miembro cuyo valor ya no existe.
+
+La lectura del proxy y la escritura de la API no fallan igual. Un `PUT` o `DELETE` con Valkey caído responde `503` y el cuerpo dice que el cambio no se aplicó. Un `Check` con Valkey caído deja seguir el request, suma `guardian_acl_lookup_errors_total` y escribe `acl no disponible`. Si esa llave se leyó hace menos de `admin.stale_ttl` (1 minuto), se usa esa copia y suma `guardian_acl_stale_served_total`. La caché fresca dura `admin.cache_ttl` (2 segundos) y se vacía al pasar de 10 000 entradas. La réplica que escribió olvida su copia al momento. Las demás la ven como tarde a los 2 segundos. `0` en `cache_ttl`, `stale_ttl`, `lookup_timeout` o `max_ttl` vuelve al default. `stale_ttl` menor que `cache_ttl` falla el arranque.
+
+`ACL` va después de `JA4`. Busca la IP en allow y en block, y el JA4 solo en block, en un solo pipeline y con tope `lookup_timeout` (20 ms). Si la IP y el JA4 están bloqueados, gana el bloqueo de la IP. Un bloqueo llena `DenyReason` y `Enforce` responde `403` aunque la ruta esté en `monitor`. La allowlist pone `Allowlisted`. Si las dos listas tienen la misma IP, el bloqueo gana. `Rules` no pisa un `DenyReason` que la ACL ya dejó. `POST /__guardian/verify` no consulta la ACL.
+
+`POST /v1/reload` devuelve `200` con `changed`, `version_anterior` y `version`. Si el archivo no se puede aplicar, responde `422`, `changed` queda en falso y sigue la config anterior. `GET /v1/config` no muestra CIDRs ni rutas del YAML.
+
+```bash
+curl -s -H "Authorization: Bearer $GUARDIAN_ADMIN_TOKEN" -H "X-Guardian-Actor: fabio" \
+  -H "Content-Type: application/json" \
+  -d '{"ttl":"30m","reason":"abuso de checkout"}' \
+  http://127.0.0.1:9091/v1/blocks/ip/203.0.113.8
+```
+
+En `deploy/compose/config/guardian.yml` la API está encendida y `redis_addr` sigue en `localhost:6379`. Dentro del contenedor esa dirección es el propio guardian, así que un `PUT` responde `503` y el proxy anota `acl no disponible`. `guardian.sqs.yml`, `guardian.kinesis.yml` y `guardian.kafka.yml` apuntan a `valkey:6379`, y ahí la ACL escribe y lee.
+
+`docker-compose.replicas.yml` levanta `guardian-b` con el mismo YAML de Kafka, el mismo Valkey y el mismo token. El proxy queda en `127.0.0.1:8081` y la Admin API en `127.0.0.1:9191`. Un bloqueo escrito en una réplica lo aplica la otra cuando vence su caché de 2 segundos. Las dos no se hablan: comparten Valkey.
+
 ### HTTPS y ClientHello
 
 El bloque `tls` enciende el listener cuando trae `listen`, `cert_file` o `key_file`. Si aparece uno, los tres son obligatorios. El proceso sale al arrancar si el certificado o la clave no se pueden leer.
@@ -363,6 +416,8 @@ internal/challenge/           prueba de trabajo, tokens y pase
 internal/clientip/            resolución de la IP del cliente
 internal/config/              parseo, validación y campos recargables
 internal/configsource/        archivo, fsnotify, poll, SIGHUP y snapshot de la cadena
+internal/acl/                 bloqueos y allowlist en Valkey
+internal/admin/               Admin API: token, ACL y recarga
 internal/events/              evento del veredicto, HMAC de la IP, buffer, SQS, Kinesis y Kafka
 internal/fingerprint/         huella HTTP y política JA4
 internal/ja4source/           origen del JA4: tls, cloudfront o none
@@ -569,6 +624,12 @@ ja4:
 | `reputation.ttl` | no | `30m` | Vida de la marca. Tiene que ser mayor que 0 |
 | `reputation.cache_ttl` | no | `10s` | Caché local del proxy. `0` o ausente vuelve a `10s` |
 | `reputation.lookup_timeout` | no | `20ms` | Tope del `GET` en el proxy |
+| `admin.enabled` | no | `false` | Abre la Admin API y consulta la ACL. Apagado, el paso no hace nada |
+| `admin.listen` | no | `127.0.0.1:9091` | Puerto propio. Choca con `listen`, `tls.listen` o `:2112` y el arranque falla |
+| `admin.max_ttl` | no | `168h` | TTL máximo de un `PUT`. `0` vuelve a 168 h |
+| `admin.cache_ttl` | no | `2s` | Caché local de la ACL. `0` vuelve a 2 s. Al pasar de 10 000 entradas se vacía |
+| `admin.stale_ttl` | no | `1m` | Si Valkey falla, cuánto sirve una lectura vieja. Tiene que ser mayor o igual que `cache_ttl` |
+| `admin.lookup_timeout` | no | `20ms` | Tope del `GET` de la ACL en el request |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -592,24 +653,26 @@ La carga también rechaza la configuración cuando:
 - `events.buffer`, `events.batch_size`, `events.flush_interval`, `events.max_retries` o `events.retry_backoff` es negativo, o `events.batch_size` pasa de 500.
 - `reputation.enabled` es verdadero y `scoring.weights.ja4_reputation` es 0, la ventana no es múltiplo del bucket, el cociente pasa de 24, `min_distinct_ips` es menor que 2, o `ttl` y `lookup_timeout` no son mayores que 0.
 - `events.enabled` es verdadero y `GUARDIAN_EVENT_SALT` mide menos de 16 caracteres.
+- `admin.enabled` es verdadero y `admin.max_ttl` o `admin.lookup_timeout` no son mayores que 0, `admin.cache_ttl` es negativo, `admin.stale_ttl` es menor que `admin.cache_ttl`, o `admin.listen` usa el puerto de `listen`, de `tls.listen` o el `:2112`.
+- `admin.enabled` es verdadero y `GUARDIAN_ADMIN_TOKEN` está vacío, trae más de dos tokens, o alguno mide menos de 32 caracteres.
 
-`GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase. `GUARDIAN_EVENT_SALT` es obligatoria solo cuando `events.enabled` es verdadero.
+`GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase. `GUARDIAN_EVENT_SALT` es obligatoria solo cuando `events.enabled` es verdadero. `GUARDIAN_ADMIN_TOKEN` es obligatoria solo cuando `admin.enabled` es verdadero.
 
 ## Recarga en caliente
 
 `guardian` vigila el archivo de `-config` y, sin reiniciar, vuelve a armar la cadena protegida cuando cambian `scoring`, `rules`, `modes` o `ja4.tools`. Cada request lee el snapshot una vez al entrar y lo usa hasta el final. `POST /__guardian/verify` y el aggregator quedan con la config de arranque.
 
-En cada recarga se reconstruyen el scorer, las reglas, los modos y la política de JA4. El resto se creó al arrancar y se reutiliza: listeners, TLS, upstream, Valkey, el límite de tasa, el desafío, los bots, el origen del JA4, la reputación, los eventos y las trazas.
+En cada recarga se reconstruyen el scorer, las reglas, los modos y la política de JA4. El resto se creó al arrancar y se reutiliza: listeners, TLS, upstream, Valkey, el límite de tasa, el desafío, los bots, el origen del JA4, la reputación, la ACL, los eventos y las trazas.
 
 - Se vigila el directorio del archivo con fsnotify. Ahí se ven el guardado atómico de un editor (temporal y rename) y el symlink `..data` de un ConfigMap de Kubernetes. Un `chmod` no dispara recarga.
 - `-config-poll` (10 s por defecto, `0` lo apaga) relee el archivo aunque fsnotify no avise. Si el hash no cambió, el log de debug dice `config_sin_cambios`.
 - Si fsnotify no arranca y `-config-poll` es `0`, el log deja `config_watch` y la recarga que queda es `SIGHUP`.
-- `SIGHUP` pide una recarga a mano: `docker compose kill -s HUP guardian`. Guardian captura esa señal.
+- `SIGHUP` pide una recarga a mano: `docker compose kill -s HUP guardian`. `POST /v1/reload` de la Admin API pide la misma recarga, con motivo `admin_api`. Guardian captura `SIGHUP`.
 - Los avisos se agrupan 250 ms y se recarga una sola vez. Ese plazo no tiene flag.
 - La versión son los primeros 12 hexadecimales del SHA-256 de los bytes del archivo. `guardian_config_info` y el campo `config_version` del log `request` de la cadena protegida muestran ese valor. El log de `POST /__guardian/verify` no lo lleva.
 - La config nueva se parsea y se mezcla con lo que quedó fijo al arrancar. Esa mezcla se valida y la cadena se construye entera antes de publicarse. Si algo falla, sigue la anterior, `guardian_config_last_reload_successful` pasa a 0 y el log dice `config_recarga_fallida`. Un poll posterior del mismo archivo rechazado no repite ese error. Un fallo al arrancar termina el proceso, porque todavía no hay config anterior.
 - Bajar `scoring.weights.ja4_reputation` a 0 mientras `reputation.enabled` quedó en verdadero al arrancar no se aplica: la mezcla no pasa la validación.
-- Un cambio fuera de esos cuatro bloques (`listen`, `tls`, `upstream`, timeouts, `redis_addr`, `rate`, `burst`, `trusted_proxies`, `ja4.source`, `challenge`, `good_bots`, `events`, `tracing`, `reputation`) deja el warning `config_requiere_reinicio` y el proceso sigue con el valor de arranque. Si el archivo igual es válido, la versión avanza, porque el hash es el del archivo. En el diff del log, un campo cuyo nombre contiene `password`, `secret`, `token` o `key_file` sale como `***`.
+- Un cambio fuera de esos cuatro bloques (`listen`, `tls`, `upstream`, timeouts, `redis_addr`, `rate`, `burst`, `trusted_proxies`, `ja4.source`, `challenge`, `good_bots`, `events`, `tracing`, `reputation`, `admin`) deja el warning `config_requiere_reinicio` y el proceso sigue con el valor de arranque. Si el archivo igual es válido, la versión avanza, porque el hash es el del archivo. En el diff del log, un campo cuyo nombre contiene `password`, `secret`, `token` o `key_file` sale como `***`.
 - Una recarga aplicada deja la línea `config_recargada` con la versión anterior, la nueva, el motivo, los cambios y `dur_ms`. Las series `ok` y `error` de `guardian_config_reloads_total` existen desde el arranque.
 
 | Métrica | Tipo | Qué dice |
@@ -633,6 +696,7 @@ sequenceDiagram
   G->>G: /healthz pasa a 503
   G->>G: espera drain_delay
   G->>C: Shutdown de HTTP y HTTPS durante shutdown_timeout
+  G->>G: cierra la Admin API con el tiempo que quede de ese plazo
   G->>G: vacía el buffer de eventos con el tiempo que quede de ese plazo
   G->>G: vacía los spans con el tiempo que quede de ese plazo
   alt terminan a tiempo
@@ -667,6 +731,13 @@ El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPT
 | `guardian_events_retries_total` | counter | `sink` | Rondas que reenviaron solo las entradas fallidas |
 | `guardian_events_send_failures_total` | counter | `sink` | Eventos perdidos después de agotar los reintentos |
 | `guardian_events_api_requests_total` | counter | `sink` | Llamadas `SendMessageBatch`, `PutRecords` o Produce de Kafka |
+| `guardian_acl_matches_total` | counter | `list`, `kind` | Requests que coincidieron con una entrada de la Admin API |
+| `guardian_acl_lookup_errors_total` | counter | — | Lecturas de la ACL que fallaron en Valkey. El request siguió |
+| `guardian_acl_stale_served_total` | counter | — | Veces que Valkey falló y se usó una entrada vieja de la caché |
+| `guardian_admin_requests_total` | counter | `route`, `code` | Requests de la Admin API. `route` es el patrón, o `unauthorized` en un `401` |
+| `guardian_admin_request_duration_seconds` | histogram | `route` | Latencia de la Admin API. Buckets: 1 ms, 5 ms, 10 ms, 50 ms, 100 ms, 500 ms, 1 s y 5 s |
+| `guardian_admin_auth_failures_total` | counter | — | `401` de la Admin API |
+| `guardian_admin_changes_total` | counter | `action`, `list`, `kind`, `result` | Altas, bajas y recargas, con el resultado |
 
 ## Ejecutar
 
@@ -763,6 +834,7 @@ Los puertos publicados escuchan solo en `127.0.0.1`:
 | Servicio | Puerto en el host | Para qué |
 | --- | --- | --- |
 | guardian | `8080` | HTTP del proxy |
+| Admin API | `9091` | Solo `127.0.0.1`. Token `GUARDIAN_ADMIN_TOKEN` |
 | Jaeger | `16686` | UI en `http://localhost:16686` |
 | Prometheus | `9090` | UI y API |
 | Grafana | `3000` | UI. El alta de usuarios está cerrada |
@@ -774,6 +846,7 @@ Los puertos publicados escuchan solo en `127.0.0.1`:
 flowchart LR
   host["127.0.0.1"]
   host -->|8080| guardian
+  host -->|9091| guardian
   host -->|16686| jaeger
   host -->|9090| prometheus
   host -->|3000| grafana
@@ -785,13 +858,14 @@ flowchart LR
 
 `deploy/compose/config/guardian.yml` es el YAML de ejemplo con el upstream en `http://upstream:9000` y el bloque `tls` comentado, así que este stack no abre `:8443`. `redis_addr` sigue en `localhost:6379` y `tracing.endpoint` en `localhost:4318`. Dentro del contenedor esas direcciones son el propio guardian. Valkey es el servicio `valkey` y Jaeger recibe OTLP en `jaeger:4318`. Con el archivo tal como está, el límite de tasa usa el limitador en memoria y los spans no llegan a Jaeger.
 
-Hace falta `deploy/compose/.env`, a partir de `.env.example`. Compose no arranca si faltan `GUARDIAN_PASS_KEYS`, `GRAFANA_ADMIN_PASSWORD` o `GUARDIAN_EVENT_SALT`. El YAML del stack deja `events.enabled` en verdadero, así que esa sal tiene que medir al menos 16 caracteres. El `.env` no se versiona.
+Hace falta `deploy/compose/.env`, a partir de `.env.example`. Compose no arranca si faltan `GUARDIAN_PASS_KEYS`, `GRAFANA_ADMIN_PASSWORD`, `GUARDIAN_EVENT_SALT` o `GUARDIAN_ADMIN_TOKEN`. El YAML del stack deja `events.enabled` y `admin.enabled` en verdadero, así que la sal tiene que medir al menos 16 caracteres y el token al menos 32. El valor de ejemplo del token hay que cambiarlo: con menos de 32 caracteres guardian no arranca. El `.env` no se versiona.
 
 ```bash
 cd deploy/compose
 cp .env.example .env
 # GUARDIAN_PASS_KEYS=k1:$(openssl rand -base64 32 | tr -d '\n')
 # GUARDIAN_EVENT_SALT=$(openssl rand -hex 32)
+# GUARDIAN_ADMIN_TOKEN=$(openssl rand -hex 32)
 docker compose up --build
 ```
 
@@ -836,7 +910,7 @@ awsl sqs list-queues
 awsl kinesis list-streams
 ```
 
-`deploy/compose/prometheus/alerts.yml` define cinco alertas del job `guardian`:
+`deploy/compose/prometheus/alerts.yml` define siete alertas del job `guardian`:
 
 | Alerta | Condición | Durante | Severidad |
 | --- | --- | --- | --- |
@@ -845,6 +919,8 @@ awsl kinesis list-streams
 | `GuardianHighLatencyP99` | p99 por encima de 500 ms | 10 minutos | `warning` |
 | `GuardianFailOpen` | algún `guardian_fail_open_total` en la ventana de 5 minutos | 2 minutos | `warning` |
 | `GuardianConfigReloadFailing` | `guardian_config_last_reload_successful == 0` | 5 minutos | `warning` |
+| `GuardianAdminAuthFailures` | más de 20 `401` de la Admin API en 10 minutos | al momento | `warning` |
+| `GuardianACLLookupErrors` | algún `guardian_acl_lookup_errors_total` en la ventana de 5 minutos | 5 minutos | `warning` |
 
 `alerts_test.yml` es la prueba de `promtool` y Prometheus no la carga. Se corre desde `deploy/compose/prometheus`:
 

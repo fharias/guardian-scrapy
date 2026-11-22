@@ -39,3 +39,16 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "guardian rechazó la última config y sigue con la anterior: busca config_recarga_fallida en el log"
+
+      - alert: GuardianAdminAuthFailures
+        expr: sum(increase(guardian_admin_auth_failures_total[10m])) > 20
+        labels: { severity: warning }
+        annotations:
+          summary: "Más de 20 requests sin token válido a la Admin API en 10 minutos: alguien está probando tokens"
+
+      - alert: GuardianACLLookupErrors
+        expr: sum(rate(guardian_acl_lookup_errors_total[5m])) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "guardian no puede leer los bloqueos de la Admin API en Valkey (fail-open): los bloqueos nuevos no se están aplicando"
