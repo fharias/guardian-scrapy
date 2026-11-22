@@ -29,7 +29,7 @@ scoring:
     ja4_reputation: 50 
   browser_ratio_min: 0.3
   thresholds:
-    challenge: 90
+    challenge: 40
     block: 85
 rules:
   honeypots: ["/admin-oculto", "/wp-login.php", "/.env"]
