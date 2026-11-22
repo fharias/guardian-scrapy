@@ -157,7 +157,7 @@ func handle(parent context.Context, api SQSAPI, queueURL string, agg *reputation
 		return err
 	}
 	for _, mk := range marked {
-		log.Info("ja4_marcado", "ja4", mk.JA4, "distinct_ips", mk.DistinctIPs)
+		log.Info("ja4_marcado", "app", mk.App, "ja4", mk.JA4, "distinct_ips", mk.DistinctIPs)
 	}
 
 	entries := make([]types.DeleteMessageBatchRequestEntry, len(msgs))

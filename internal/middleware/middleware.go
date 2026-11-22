@@ -36,6 +36,22 @@ func Init(next http.Handler) http.Handler {
 	})
 }
 
+// App deja en el veredicto la app dueña de esta cadena. Cada app tiene su
+// propia cadena (la arma main, una por app), así que el nombre queda fijo en
+// la closure: el Host se resolvió UNA vez en el apps.Router y de aquí en
+// adelante todos (ratelimit, ACL, reputation, métricas, events, logs y traces)
+// leen v.App en vez de volver a mirar el Host.
+func App(name string) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if v := verdict.From(r.Context()); v != nil {
+				v.App = name
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // ConfigVersion deja en el veredicto el hash de la config con la que se
 // construyó esta cadena. Como la cadena entera se reconstruye en cada recarga,
 // el valor queda fijo dentro de la closure: el log de cada request dice con
@@ -62,6 +78,7 @@ func Logger(log *slog.Logger) Middleware {
 				v = &verdict.Verdict{}
 			}
 			attrs := []any{
+				"app", v.App,
 				"client_ip", v.ClientIP.String(),
 				"mode", v.Mode,
 				"shadow", v.Shadowed,
@@ -258,7 +275,7 @@ func Reputation(rep *reputation.Reader, log *slog.Logger) Middleware {
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if v := verdict.From(r.Context()); v != nil && v.JA4 != "" {
-				bad, _, err := rep.Bad(r.Context(), v.JA4)
+				bad, _, err := rep.Bad(r.Context(), v.App, v.JA4)
 				if err != nil {
 					log.Warn("reputation no disponible", "err", err)
 				}
@@ -281,7 +298,7 @@ func ACL(store *acl.Store, log *slog.Logger) Middleware {
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if v := verdict.From(r.Context()); v != nil {
-				m, err := store.Check(r.Context(), v.ClientIP, v.JA4)
+				m, err := store.Check(r.Context(), v.App, v.ClientIP, v.JA4)
 				if err != nil {
 					log.Warn("acl no disponible", "err", err)
 				}

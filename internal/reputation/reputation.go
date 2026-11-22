@@ -2,6 +2,11 @@
 // cuenta IPs distintas por JA4 con HyperLogLog y, si un JA4 aparece en
 // demasiadas IPs, le deja una reputación con TTL en Redis/Valkey.
 // El aggregator escribe (Aggregator) y el proxy lee (Reader).
+//
+// La reputación es POR APP (gd:<app>:ja4rep:{ja4}): un JA4 que satura la API
+// no queda marcado en la tienda. Es una decisión, no un detalle; la otra
+// opción (una reputación global) tiene sentido si las apps comparten
+// atacantes, y se discute en la lección.
 package reputation
 
 import (
@@ -12,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fharias/guardian-scrapy/internal/apps"
 	"github.com/fharias/guardian-scrapy/internal/events"
 	"github.com/redis/go-redis/v9"
 )
@@ -115,19 +121,34 @@ func (c Config) windowKeys(app, ja4 string, now time.Time) []string {
 // valor. Por eso un mensaje que SQS entrega dos veces no infla nada.
 type Aggregator struct {
 	rdb redis.UniversalClient
-	app string
+	app string // para eventos sin app (de versiones anteriores de guardian)
 	cfg Config
 	now func() time.Time
 }
 
+// NewAggregator: app es la app de los eventos que llegan SIN app, los que
+// emitió una versión anterior de guardian y siguen en la cola durante el
+// deploy. Cada evento nuevo trae la suya.
 func NewAggregator(rdb redis.UniversalClient, app string, cfg Config) *Aggregator {
 	return &Aggregator{rdb: rdb, app: app, cfg: cfg.WithDefaults(), now: time.Now}
 }
 
-// Marked es un JA4 que cruzó el umbral en este lote.
+// Marked es un JA4 que cruzó el umbral en este lote, en una app.
 type Marked struct {
+	App         string
 	JA4         string
 	DistinctIPs int64
+}
+
+type appJA4 struct{ app, ja4 string }
+
+// appOf decide en qué app se cuenta un evento. Un nombre inválido no se usa
+// tal cual: el evento viene de la cola y termina dentro de una llave de Redis.
+func (a *Aggregator) appOf(ev events.Event) string {
+	if apps.ValidName(ev.App) {
+		return ev.App
+	}
+	return a.app
 }
 
 // Apply hace a lo sumo tres viajes a Redis (tres pipelines), sin importar el tamaño del lote:
@@ -138,7 +159,7 @@ type Marked struct {
 // Si devuelve error, el caller NO debe borrar los mensajes: volverán a llegar
 // y, como todo es idempotente, reaplicarlos es seguro.
 func (a *Aggregator) Apply(ctx context.Context, evs []events.Event) ([]Marked, error) {
-	touched := make(map[string]struct{})
+	touched := make(map[appJA4]struct{})
 	pipe := a.rdb.Pipeline()
 	for _, ev := range evs {
 		if ev.JA4 == "" || ev.IPHash == "" {
@@ -148,11 +169,12 @@ func (a *Aggregator) Apply(ctx context.Context, evs []events.Event) ([]Marked, e
 		if t.IsZero() {
 			t = a.now()
 		}
-		key := hllKey(a.app, ev.JA4, t.UTC().Truncate(a.cfg.Bucket))
+		app := a.appOf(ev)
+		key := hllKey(app, ev.JA4, t.UTC().Truncate(a.cfg.Bucket))
 		pipe.PFAdd(ctx, key, ev.IPHash)
 		// El bucket vive la ventana completa más uno de holgura y se borra solo.
 		pipe.Expire(ctx, key, a.cfg.Window+a.cfg.Bucket)
-		touched[ev.JA4] = struct{}{}
+		touched[appJA4{app, ev.JA4}] = struct{}{}
 	}
 	if len(touched) == 0 {
 		return nil, nil
@@ -162,10 +184,10 @@ func (a *Aggregator) Apply(ctx context.Context, evs []events.Event) ([]Marked, e
 	}
 
 	now := a.now()
-	counts := make(map[string]*redis.IntCmd, len(touched))
+	counts := make(map[appJA4]*redis.IntCmd, len(touched))
 	pipe = a.rdb.Pipeline()
-	for ja4 := range touched {
-		counts[ja4] = pipe.PFCount(ctx, a.cfg.windowKeys(a.app, ja4, now)...)
+	for k := range touched {
+		counts[k] = pipe.PFCount(ctx, a.cfg.windowKeys(k.app, k.ja4, now)...)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("reputation: PFCOUNT: %w", err)
@@ -173,14 +195,14 @@ func (a *Aggregator) Apply(ctx context.Context, evs []events.Event) ([]Marked, e
 
 	var marked []Marked
 	pipe = a.rdb.Pipeline()
-	for ja4, cmd := range counts {
+	for k, cmd := range counts {
 		n := cmd.Val()
 		if n < a.cfg.MinDistinctIPs {
 			continue
 		}
 		// Guardamos el conteo como valor: útil para depurar con valkey-cli GET.
-		pipe.Set(ctx, repKey(a.app, ja4), n, a.cfg.TTL)
-		marked = append(marked, Marked{JA4: ja4, DistinctIPs: n})
+		pipe.Set(ctx, repKey(k.app, k.ja4), n, a.cfg.TTL)
+		marked = append(marked, Marked{App: k.app, JA4: k.ja4, DistinctIPs: n})
 	}
 	if len(marked) > 0 {
 		if _, err := pipe.Exec(ctx); err != nil {
@@ -194,9 +216,10 @@ func (a *Aggregator) Apply(ctx context.Context, evs []events.Event) ([]Marked, e
 
 // Reader lo usa el proxy en cada request. Un GET a Redis por request sería
 // otro round trip como el de mw.ratelimit; por eso hay una caché local corta.
+// Un solo Reader atiende a todas las apps: la caché va por llave completa
+// (app + JA4), así que el mismo JA4 en dos apps son dos entradas.
 type Reader struct {
 	rdb redis.UniversalClient
-	app string
 	cfg Config
 	now func() time.Time
 
@@ -209,20 +232,21 @@ type cacheEntry struct {
 	expires time.Time
 }
 
-func NewReader(rdb redis.UniversalClient, app string, cfg Config) *Reader {
-	return &Reader{rdb: rdb, app: app, cfg: cfg.WithDefaults(), now: time.Now, cache: make(map[string]cacheEntry)}
+func NewReader(rdb redis.UniversalClient, cfg Config) *Reader {
+	return &Reader{rdb: rdb, cfg: cfg.WithDefaults(), now: time.Now, cache: make(map[string]cacheEntry)}
 }
 
 // Bad dice si el JA4 tiene mala reputación. Ante un error de Redis devuelve
 // false y el error: fail-open, igual que el rate limit. Nunca bloqueamos a
 // alguien porque nuestra base de datos esté caída.
-func (r *Reader) Bad(ctx context.Context, ja4 string) (bool, int64, error) {
-	if ja4 == "" {
+func (r *Reader) Bad(ctx context.Context, app, ja4 string) (bool, int64, error) {
+	if ja4 == "" || !apps.ValidName(app) {
 		return false, 0, nil
 	}
+	key := repKey(app, ja4)
 	now := r.now()
 	r.mu.Lock()
-	e, ok := r.cache[ja4]
+	e, ok := r.cache[key]
 	r.mu.Unlock()
 	if ok && now.Before(e.expires) {
 		return e.bad, 0, nil
@@ -230,20 +254,20 @@ func (r *Reader) Bad(ctx context.Context, ja4 string) (bool, int64, error) {
 
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.LookupTimeout)
 	defer cancel()
-	val, err := r.rdb.Get(ctx, repKey(r.app, ja4)).Result()
+	val, err := r.rdb.Get(ctx, key).Result()
 	switch {
 	case errors.Is(err, redis.Nil):
-		r.store(ja4, false, now)
+		r.store(key, false, now)
 		return false, 0, nil
 	case err != nil:
 		return false, 0, fmt.Errorf("reputation: GET: %w", err) // no se cachea: reintenta en el próximo request
 	}
 	n, _ := strconv.ParseInt(val, 10, 64)
-	r.store(ja4, true, now)
+	r.store(key, true, now)
 	return true, n, nil
 }
 
-func (r *Reader) store(ja4 string, bad bool, now time.Time) {
+func (r *Reader) store(key string, bad bool, now time.Time) {
 	if r.cfg.CacheTTL == 0 {
 		return
 	}
@@ -254,5 +278,5 @@ func (r *Reader) store(ja4 string, bad bool, now time.Time) {
 		// Vaciar todo es tosco pero O(1) y suficiente con un TTL de segundos.
 		r.cache = make(map[string]cacheEntry)
 	}
-	r.cache[ja4] = cacheEntry{bad: bad, expires: now.Add(r.cfg.CacheTTL)}
+	r.cache[key] = cacheEntry{bad: bad, expires: now.Add(r.cfg.CacheTTL)}
 }

@@ -1,0 +1,87 @@
+# Dos apps en el MISMO guardian, resueltas por el header Host.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.apps.yml up -d --build
+#
+#   shop.local, *.shop.local -> app shop: enforce, upstream "shop", rate 1/s burst 2
+#   api.local                -> app api:  monitor, upstream "api",  rate 20/s burst 40
+#   cualquier otro Host      -> 421 (no hay default_app)
+#
+# Todo lo que una app no define (scoring, rules, modes, upstream, rate, burst)
+# lo hereda COMPLETO del nivel superior de este archivo.
+listen: ":8080"
+upstream: "http://upstream:9000"
+redis_addr: "valkey:6379"
+app: "shop"                 # solo se usa sin apps; con apps, los nombres van abajo
+rate: 1
+burst: 2
+preserve_host: true
+read_header_timeout: 5s
+read_timeout: 20s
+write_timeout: 20s
+idle_timeout: 10s
+shutdown_timeout: 20s
+drain_delay: 5s
+trusted_proxies:
+  - "127.0.0.0/8"
+  - "::1/128"
+  - "172.16.0.0/12"
+  - "192.168.65.0/24"
+x_forwarded_for_header: "X-Forwarded-For"
+scoring:
+  weights:
+    ua_tool: 90
+    headers_incomplete: 30
+    honeypot: 50
+    rate_exceeded: 100
+    low_browser_ratio: 15
+    fake_bot: 90
+    ja4_mismatch: 60
+  browser_ratio_min: 0.3
+  thresholds:
+    challenge: 40
+    block: 85
+rules:
+  honeypots: ["/admin-oculto", "/wp-login.php", "/.env"]
+challenge:
+  difficulty: 16
+  ttl: 2m
+  pass_ttl: 1h
+modes:
+  default: enforce
+ja4:
+  source: "tls"
+tracing:
+  enabled: true
+  endpoint: "jaeger:4318"
+  insecure: true
+  sample_ratio: 1.0
+  trust_incoming: false
+events:
+  enabled: true
+  sink: log
+  buffer: 1024
+admin:
+  enabled: true
+  listen: ":9091"
+  max_ttl: 168h
+  cache_ttl: 2s
+  stale_ttl: 1m
+  lookup_timeout: 20ms
+# Sin default_app: un Host que no está abajo recibe 421 Misdirected Request.
+# default_app: shop
+#
+# La sección apps va AL FINAL a propósito: para la demo de recarga basta con
+# agregar una app con `cat >>`, sin editar en el medio del archivo.
+apps:
+  - name: shop
+    hosts: ["shop.local", "*.shop.local"]
+    # sin upstream, rate, burst, scoring, rules ni modes: hereda todo
+  - name: api
+    hosts: ["api.local"]
+    upstream: "http://upstream-api:9000"
+    rate: 20
+    burst: 40
+    modes:
+      default: monitor      # API nueva: primero medimos, después bloqueamos
+    rules:
+      honeypots: ["/v1/debug", "/.git/config"]

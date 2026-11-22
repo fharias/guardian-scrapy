@@ -108,6 +108,8 @@ func TestMergeReloadableCubreLaLista(t *testing.T) {
 	incoming.Rules.Honeypots = []string{"/.env"}
 	incoming.Modes.Default = policy.Monitor
 	incoming.JA4.Tools = []fingerprint.KnownJA4{{Name: "curl", JA4: "t13d"}}
+	incoming.Apps = []AppConfig{{Name: "api", Hosts: []string{"api.local"}}}
+	incoming.DefaultApp = "api"
 	// y cosas que requieren reinicio:
 	incoming.Rate = 50
 	incoming.Listen = ":9999"
@@ -124,7 +126,7 @@ func TestMergeReloadableCubreLaLista(t *testing.T) {
 	for _, p := range Reloadable {
 		found := false
 		for _, c := range applied {
-			if c.Path == p || strings.HasPrefix(c.Path, p+".") {
+			if c.Path == p || strings.HasPrefix(c.Path, p+".") || strings.HasPrefix(c.Path, p+"[") {
 				found = true
 			}
 		}

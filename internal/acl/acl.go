@@ -10,6 +10,9 @@
 //     NUNCA gana a una negación dura (deny gana, como en IAM).
 //   - Toda entrada tiene TTL. Lo permanente va en el YAML (rules.deny_cidrs),
 //     versionado en git y con code review.
+//   - Toda entrada es de UNA app: vive bajo gd:<app>:acl:. Bloquear una IP en
+//     "shop" no la bloquea en "api". Un solo Store atiende a todas las apps
+//     (una caché, un juego de métricas); la app viaja en cada llamada.
 package acl
 
 import (
@@ -26,6 +29,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/fharias/guardian-scrapy/internal/apps"
 	"github.com/fharias/guardian-scrapy/internal/fingerprint"
 )
 
@@ -59,6 +63,7 @@ var ErrInvalid = errors.New("acl: entrada inválida")
 
 // Entry es lo que se guarda en Redis como JSON, una llave por entrada.
 type Entry struct {
+	App       string    `json:"app"`
 	List      List      `json:"list"`
 	Kind      Kind      `json:"kind"`
 	Value     string    `json:"value"`
@@ -121,10 +126,9 @@ type Options struct {
 	Now           func() time.Time      // default time.Now; los tests lo controlan
 }
 
-// Store lee (proxy) y escribe (Admin API) las entradas.
+// Store lee (proxy) y escribe (Admin API) las entradas de todas las apps.
 type Store struct {
 	rdb  redis.UniversalClient
-	app  string
 	opts Options
 
 	mu    sync.Mutex
@@ -140,7 +144,7 @@ type cached struct {
 	fetched time.Time
 }
 
-func New(rdb redis.UniversalClient, app string, opts Options) *Store {
+func New(rdb redis.UniversalClient, opts Options) *Store {
 	if opts.CacheTTL == 0 {
 		opts.CacheTTL = DefaultCacheTTL
 	}
@@ -162,13 +166,12 @@ func New(rdb redis.UniversalClient, app string, opts Options) *Store {
 	f := promauto.With(opts.Registerer)
 	return &Store{
 		rdb:   rdb,
-		app:   app,
 		opts:  opts,
 		cache: make(map[string]cached),
 		matches: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "guardian_acl_matches_total",
-			Help: "Requests que matchearon una entrada de la Admin API, por lista y tipo.",
-		}, []string{"list", "kind"}),
+			Help: "Requests que matchearon una entrada de la Admin API, por app, lista y tipo.",
+		}, []string{"app", "list", "kind"}),
 		errors: f.NewCounter(prometheus.CounterOpts{
 			Name: "guardian_acl_lookup_errors_total",
 			Help: "Lecturas de la ACL que fallaron contra Redis (el request siguió: fail-open).",
@@ -196,6 +199,15 @@ func indexKey(app string, list List) string {
 
 func indexMember(kind Kind, value string) string { return string(kind) + ":" + value }
 
+// checkApp: el nombre va dentro de la llave. Uno inválido (con ':' o llaves)
+// podría escribir en el espacio de OTRA app o cambiar el hash tag.
+func checkApp(app string) error {
+	if !apps.ValidName(app) {
+		return fmt.Errorf("%w: app %q", ErrInvalid, app)
+	}
+	return nil
+}
+
 // Match es lo que encontró Check. Pueden venir las dos: el scorer decide.
 type Match struct {
 	Block *Entry
@@ -209,7 +221,10 @@ type Match struct {
 // vencida, si tiene menos de StaleTTL) y el error: fail-open. Un bloqueo activo
 // no desaparece por un parpadeo de Redis, pero tampoco bloqueamos a nadie
 // porque Redis esté caído.
-func (s *Store) Check(ctx context.Context, ip netip.Addr, ja4 string) (Match, error) {
+func (s *Store) Check(ctx context.Context, app string, ip netip.Addr, ja4 string) (Match, error) {
+	if err := checkApp(app); err != nil {
+		return Match{}, err
+	}
 	type lookup struct {
 		list List
 		kind Kind
@@ -219,11 +234,11 @@ func (s *Store) Check(ctx context.Context, ip netip.Addr, ja4 string) (Match, er
 	if ip.IsValid() {
 		v := ip.Unmap().String()
 		want = append(want,
-			lookup{Allow, KindIP, entryKey(s.app, Allow, KindIP, v)},
-			lookup{Block, KindIP, entryKey(s.app, Block, KindIP, v)})
+			lookup{Allow, KindIP, entryKey(app, Allow, KindIP, v)},
+			lookup{Block, KindIP, entryKey(app, Block, KindIP, v)})
 	}
 	if ja4 != "" {
-		want = append(want, lookup{Block, KindJA4, entryKey(s.app, Block, KindJA4, ja4)})
+		want = append(want, lookup{Block, KindJA4, entryKey(app, Block, KindJA4, ja4)})
 	}
 	if len(want) == 0 {
 		return Match{}, nil
@@ -276,10 +291,10 @@ func (s *Store) Check(ctx context.Context, ip netip.Addr, ja4 string) (Match, er
 		switch {
 		case l.list == Allow && m.Allow == nil:
 			m.Allow = e
-			s.matches.WithLabelValues(string(l.list), string(l.kind)).Inc()
+			s.matches.WithLabelValues(app, string(l.list), string(l.kind)).Inc()
 		case l.list == Block && m.Block == nil:
 			m.Block = e
-			s.matches.WithLabelValues(string(l.list), string(l.kind)).Inc()
+			s.matches.WithLabelValues(app, string(l.list), string(l.kind)).Inc()
 		}
 	}
 	return m, lookupErr
@@ -344,21 +359,25 @@ func (s *Store) forget(key string) {
 // Normalize. Escribe la llave y el índice en un pipeline (no MULTI: en Redis
 // Cluster las dos llaves pueden caer en slots distintos). Si se cae entre los
 // dos comandos, el índice queda desfasado; List lo tolera.
-func (s *Store) Put(ctx context.Context, e Entry, ttl time.Duration) (Entry, error) {
+func (s *Store) Put(ctx context.Context, app string, e Entry, ttl time.Duration) (Entry, error) {
+	if err := checkApp(app); err != nil {
+		return Entry{}, err
+	}
 	if ttl <= 0 {
 		return Entry{}, fmt.Errorf("%w: ttl debe ser > 0", ErrInvalid)
 	}
 	now := s.opts.Now().UTC()
+	e.App = app
 	e.CreatedAt = now
 	e.ExpiresAt = now.Add(ttl)
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return Entry{}, err
 	}
-	key := entryKey(s.app, e.List, e.Kind, e.Value)
+	key := entryKey(app, e.List, e.Kind, e.Value)
 	pipe := s.rdb.Pipeline()
 	pipe.Set(ctx, key, raw, ttl)
-	pipe.ZAdd(ctx, indexKey(s.app, e.List), redis.Z{
+	pipe.ZAdd(ctx, indexKey(app, e.List), redis.Z{
 		Score:  float64(e.ExpiresAt.UnixMilli()),
 		Member: indexMember(e.Kind, e.Value),
 	})
@@ -370,8 +389,11 @@ func (s *Store) Put(ctx context.Context, e Entry, ttl time.Duration) (Entry, err
 }
 
 // Get lee directo de Redis, sin caché: la Admin API siempre muestra la verdad.
-func (s *Store) Get(ctx context.Context, list List, kind Kind, value string) (*Entry, error) {
-	raw, err := s.rdb.Get(ctx, entryKey(s.app, list, kind, value)).Bytes()
+func (s *Store) Get(ctx context.Context, app string, list List, kind Kind, value string) (*Entry, error) {
+	if err := checkApp(app); err != nil {
+		return nil, err
+	}
+	raw, err := s.rdb.Get(ctx, entryKey(app, list, kind, value)).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, nil
 	}
@@ -386,11 +408,14 @@ func (s *Store) Get(ctx context.Context, list List, kind Kind, value string) (*E
 }
 
 // Delete borra la entrada. Devuelve false si no existía.
-func (s *Store) Delete(ctx context.Context, list List, kind Kind, value string) (bool, error) {
-	key := entryKey(s.app, list, kind, value)
+func (s *Store) Delete(ctx context.Context, app string, list List, kind Kind, value string) (bool, error) {
+	if err := checkApp(app); err != nil {
+		return false, err
+	}
+	key := entryKey(app, list, kind, value)
 	pipe := s.rdb.Pipeline()
 	del := pipe.Del(ctx, key)
-	pipe.ZRem(ctx, indexKey(s.app, list), indexMember(kind, value))
+	pipe.ZRem(ctx, indexKey(app, list), indexMember(kind, value))
 	if _, err := pipe.Exec(ctx); err != nil {
 		return false, fmt.Errorf("acl: DEL: %w", err)
 	}
@@ -401,8 +426,11 @@ func (s *Store) Delete(ctx context.Context, list List, kind Kind, value string) 
 // List devuelve las entradas vigentes de una lista. Primero poda del índice lo
 // vencido (ZREMRANGEBYSCORE) y luego trae cada llave; si una ya no existe
 // (expiró o la borraron a medias) simplemente no aparece.
-func (s *Store) List(ctx context.Context, list List) ([]Entry, error) {
-	idx := indexKey(s.app, list)
+func (s *Store) List(ctx context.Context, app string, list List) ([]Entry, error) {
+	if err := checkApp(app); err != nil {
+		return nil, err
+	}
+	idx := indexKey(app, list)
 	nowMs := s.opts.Now().UnixMilli()
 	if err := s.rdb.ZRemRangeByScore(ctx, idx, "-inf", fmt.Sprint(nowMs)).Err(); err != nil {
 		return nil, fmt.Errorf("acl: ZREMRANGEBYSCORE: %w", err)
@@ -421,7 +449,7 @@ func (s *Store) List(ctx context.Context, list List) ([]Entry, error) {
 		if !ok {
 			continue
 		}
-		keys = append(keys, entryKey(s.app, list, Kind(kind), value))
+		keys = append(keys, entryKey(app, list, Kind(kind), value))
 	}
 	got, err := s.fetch(ctx, keys)
 	if err != nil {

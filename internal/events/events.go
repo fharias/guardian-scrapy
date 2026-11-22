@@ -43,6 +43,7 @@ const (
 // No lleva la IP en claro: la IP es dato personal (Ley 1581 de 2012).
 type Event struct {
 	Time        time.Time `json:"ts"`
+	App         string    `json:"app,omitempty"` // vacío solo en eventos de versiones anteriores
 	IPHash      string    `json:"ip_hash"`
 	JA4         string    `json:"ja4,omitempty"`
 	JA4Source   string    `json:"ja4_source,omitempty"`
@@ -220,6 +221,7 @@ func NewLogSink(log *slog.Logger) *LogSink {
 func (s *LogSink) Emit(_ context.Context, ev Event) error {
 	s.log.Info("event",
 		"ts", ev.Time,
+		"app", ev.App,
 		"ip_hash", ev.IPHash,
 		"ja4", ev.JA4,
 		"ja4_source", ev.JA4Source,

@@ -1,0 +1,24 @@
+# Override multi-app: el MISMO guardian atiende shop.local y api.local, cada
+# una con su upstream y su política (config/guardian.apps.yml).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.apps.yml up -d --build
+#
+# Solo cambia el -config de guardian y agrega un segundo upstream. El directorio
+# ./config ya viene montado desde docker-compose.yml.
+services:
+  upstream:
+    environment:
+      UPSTREAM_NAME: shop
+
+  upstream-api:
+    build:
+      context: ../..
+      args: { CMD: upstream }
+    image: guardian-upstream:dev
+    environment:
+      UPSTREAM_NAME: api
+
+  guardian:
+    command: ["-config", "/etc/guardian/guardian.apps.yml"]
+    depends_on:
+      upstream-api: { condition: service_started }

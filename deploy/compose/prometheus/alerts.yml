@@ -8,14 +8,16 @@ groups:
         annotations:
           summary: "guardian no responde en /metrics"
 
+      # Por app: si una app chica se cae entera, el promedio global con una
+      # app grande y sana la escondería.
       - alert: GuardianHighErrorRate
         expr: |
-          sum(rate(guardian_http_requests_total{code=~"5.."}[5m]))
-            / sum(rate(guardian_http_requests_total[5m])) > 0.05
+          sum by (app) (rate(guardian_http_requests_total{code=~"5.."}[5m]))
+            / sum by (app) (rate(guardian_http_requests_total[5m])) > 0.05
         for: 5m
         labels: { severity: critical }
         annotations:
-          summary: "Más del 5% de los requests terminan en 5xx"
+          summary: "Más del 5% de los requests de {{ $labels.app }} terminan en 5xx"
 
       - alert: GuardianHighLatencyP99
         expr: |
@@ -39,16 +41,3 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "guardian rechazó la última config y sigue con la anterior: busca config_recarga_fallida en el log"
-
-      - alert: GuardianAdminAuthFailures
-        expr: sum(increase(guardian_admin_auth_failures_total[10m])) > 20
-        labels: { severity: warning }
-        annotations:
-          summary: "Más de 20 requests sin token válido a la Admin API en 10 minutos: alguien está probando tokens"
-
-      - alert: GuardianACLLookupErrors
-        expr: sum(rate(guardian_acl_lookup_errors_total[5m])) > 0
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "guardian no puede leer los bloqueos de la Admin API en Valkey (fail-open): los bloqueos nuevos no se están aplicando"

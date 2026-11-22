@@ -84,7 +84,7 @@ func fakeEdge(next http.Handler) http.Handler {
 func newReplica(t *testing.T, rdb redis.UniversalClient, clk *clock) replica {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	store := acl.New(rdb, "shop", acl.Options{CacheTTL: 2 * time.Second, LookupTimeout: time.Second, Now: clk.Now})
+	store := acl.New(rdb, acl.Options{CacheTTL: 2 * time.Second, LookupTimeout: time.Second, Now: clk.Now})
 
 	scorer, err := scoring.New(scoring.Config{
 		Weights:    scoring.Weights{UATool: 90, HeadersIncomplete: 30},
@@ -115,6 +115,7 @@ func newReplica(t *testing.T, rdb redis.UniversalClient, clk *clock) replica {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "upstream") })
 	proxy := middleware.Chain(upstream,
 		middleware.Init,
+		middleware.App("shop"),
 		last.capture,
 		fakeEdge,
 		middleware.SuspiciousUA(),
@@ -128,7 +129,8 @@ func newReplica(t *testing.T, rdb redis.UniversalClient, clk *clock) replica {
 	if err != nil {
 		t.Fatal(err)
 	}
-	api, err := admin.NewHandler(admin.Options{Store: store, Tokens: tokens, MaxTTL: 24 * time.Hour, Logger: logger})
+	apps := func() ([]string, string) { return []string{"shop"}, "shop" }
+	api, err := admin.NewHandler(admin.Options{Store: store, Apps: apps, Tokens: tokens, MaxTTL: 24 * time.Hour, Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}

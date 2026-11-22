@@ -60,7 +60,8 @@ func newAPI(t *testing.T, mutate func(*Options)) *api {
 	logs := &syncBuffer{}
 	reg := prometheus.NewRegistry()
 	o := Options{
-		Store:      acl.New(rdb, "shop", acl.Options{CacheTTL: -1}),
+		Store:      acl.New(rdb, acl.Options{CacheTTL: -1}),
+		Apps:       func() ([]string, string) { return []string{"shop"}, "shop" }, // como una config sin apps
 		Tokens:     tokens,
 		MaxTTL:     24 * time.Hour,
 		Logger:     slog.New(slog.NewJSONHandler(logs, nil)),
@@ -122,9 +123,14 @@ func TestParseTokens(t *testing.T) {
 
 func TestNewHandlerRequiresTokens(t *testing.T) {
 	mr := miniredis.RunT(t)
-	store := acl.New(redis.NewClient(&redis.Options{Addr: mr.Addr()}), "shop", acl.Options{})
-	if _, err := NewHandler(Options{Store: store}); err == nil {
+	store := acl.New(redis.NewClient(&redis.Options{Addr: mr.Addr()}), acl.Options{})
+	apps := func() ([]string, string) { return []string{"shop"}, "shop" }
+	if _, err := NewHandler(Options{Store: store, Apps: apps}); err == nil {
 		t.Fatal("sin tokens NewHandler debe fallar: nunca una Admin API abierta")
+	}
+	tokens, _ := ParseTokens(tokenA)
+	if _, err := NewHandler(Options{Store: store, Tokens: tokens}); err == nil {
+		t.Fatal("sin Apps NewHandler debe fallar")
 	}
 }
 
@@ -339,6 +345,91 @@ func TestConfigInfo(t *testing.T) {
 	rec := a.do(t, "GET", "/v1/config", tokenA, "")
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "fede100cd5ef") {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+}
+
+// Multi-app: cada app tiene su espacio, la ruta lleva {app} y una app que no
+// está en la config vigente es 404 (y no escribe nada). Las apps se leen en
+// CADA request: si una recarga agrega una, la API la ve sin reiniciar.
+func TestPerAppRoutes(t *testing.T) {
+	var mu sync.Mutex
+	names, def := []string{"api", "shop"}, ""
+	a := newAPI(t, func(o *Options) {
+		o.Apps = func() ([]string, string) { mu.Lock(); defer mu.Unlock(); return names, def }
+	})
+	const body = `{"ttl":"1h","reason":"scraper"}`
+
+	if rec := a.do(t, "PUT", "/v1/apps/shop/blocks/ip/203.0.113.10", tokenA, body); rec.Code != 200 ||
+		!strings.Contains(rec.Body.String(), `"app":"shop"`) {
+		t.Fatalf("PUT shop = %d %s", rec.Code, rec.Body)
+	}
+	if !a.mr.Exists("gd:shop:acl:block:ip:203.0.113.10") {
+		t.Fatalf("llaves: %v", a.mr.Keys())
+	}
+	if rec := a.do(t, "GET", "/v1/apps/api/blocks", tokenA, ""); !strings.Contains(rec.Body.String(), `"count":0`) {
+		t.Fatalf("api no debe ver el bloqueo de shop: %s", rec.Body)
+	}
+	if rec := a.do(t, "GET", "/v1/apps/api/blocks/ip/203.0.113.10", tokenA, ""); rec.Code != 404 {
+		t.Fatalf("GET api = %d", rec.Code)
+	}
+
+	// Sin default_app, las rutas de siempre no adivinan: 404 con pista.
+	rec := a.do(t, "GET", "/v1/blocks", tokenA, "")
+	if rec.Code != 404 || !strings.Contains(rec.Body.String(), "default_app") || !strings.Contains(rec.Body.String(), `"shop"`) {
+		t.Fatalf("legacy sin default = %d %s", rec.Code, rec.Body)
+	}
+
+	// App desconocida o con un nombre que no es válido: 404, nada en Redis,
+	// y el nombre inventado no se devuelve.
+	before := len(a.mr.Keys())
+	for _, app := range []string{"blog", "Shop", "a:b", "%7Bx%7D"} {
+		rec := a.do(t, "PUT", "/v1/apps/"+app+"/blocks/ip/203.0.113.11", tokenA, body)
+		if rec.Code != 404 || strings.Contains(rec.Body.String(), app) {
+			t.Fatalf("PUT %s = %d %s", app, rec.Code, rec.Body)
+		}
+	}
+	if len(a.mr.Keys()) != before {
+		t.Fatalf("una app desconocida escribió: %v", a.mr.Keys())
+	}
+
+	// Una recarga agrega blog y la vuelve default: sin tocar el handler.
+	mu.Lock()
+	names, def = []string{"api", "blog", "shop"}, "blog"
+	mu.Unlock()
+	if rec := a.do(t, "PUT", "/v1/blocks/ip/203.0.113.12", tokenA, body); rec.Code != 200 || !a.mr.Exists("gd:blog:acl:block:ip:203.0.113.12") {
+		t.Fatalf("legacy -> default blog = %d %s", rec.Code, rec.Body)
+	}
+	rec = a.do(t, "GET", "/v1/apps", tokenA, "")
+	if !strings.Contains(rec.Body.String(), `"apps":["api","blog","shop"]`) || !strings.Contains(rec.Body.String(), `"default_app":"blog"`) {
+		t.Fatalf("GET /v1/apps = %s", rec.Body)
+	}
+
+	// Métricas: el patrón con {app} y el label app de los cambios, nunca la URL.
+	mfs, _ := a.reg.Gather()
+	var routes, changes []string
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			l := map[string]string{}
+			for _, p := range m.GetLabel() {
+				l[p.GetName()] = p.GetValue()
+			}
+			switch mf.GetName() {
+			case "guardian_admin_requests_total":
+				routes = append(routes, l["route"])
+			case "guardian_admin_changes_total":
+				changes = append(changes, l["action"]+"/"+l["app"]+"/"+l["result"])
+			}
+		}
+	}
+	joined := strings.Join(routes, "|")
+	if !strings.Contains(joined, "PUT /v1/apps/{app}/blocks/{kind}/{value}") || strings.Contains(joined, "203.0.113") || strings.Contains(joined, "/shop/") {
+		t.Fatalf("routes = %v", routes)
+	}
+	if c := strings.Join(changes, "|"); !strings.Contains(c, "put/shop/ok") || !strings.Contains(c, "put/blog/ok") {
+		t.Fatalf("changes = %v", changes)
+	}
+	if !strings.Contains(a.logs.String(), `"app":"shop"`) {
+		t.Fatal("el audit log debe decir la app")
 	}
 }
 

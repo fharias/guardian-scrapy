@@ -40,6 +40,7 @@ type Signals struct {
 }
 
 type Verdict struct {
+	App         string // la app dueña del Host; la pone middleware.App en la cadena de cada app
 	ClientIP    netip.Addr
 	Score       int
 	Signals     Signals

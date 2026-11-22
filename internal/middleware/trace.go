@@ -54,6 +54,7 @@ func Trace(tr trace.Tracer, o TraceOptions) Middleware {
 			}
 			if v := verdict.From(ctx); v != nil {
 				span.SetAttributes(
+					attribute.String("guardian.app", v.App),
 					attribute.String("guardian.decision", v.Decision.String()),
 					attribute.Int("guardian.score", v.Score),
 					attribute.String("guardian.mode", v.Mode),

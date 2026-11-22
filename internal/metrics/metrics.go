@@ -21,6 +21,11 @@ type Metrics struct {
 	inFlight  prometheus.Gauge
 	decisions *prometheus.CounterVec
 	signals   *prometheus.CounterVec
+
+	// UnknownHost cuenta los requests cuyo Host no es de ninguna app (421).
+	// SIN label host: el Host lo escribe el cliente, y un scanner que manda
+	// un Host distinto por request crearía una serie por request.
+	UnknownHost prometheus.Counter
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -28,25 +33,29 @@ func New(reg prometheus.Registerer) *Metrics {
 	return &Metrics{
 		requests: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "guardian_http_requests_total",
-			Help: "Requests atendidos por guardian, por ruta, método y status code.",
-		}, []string{"route", "method", "code"}),
+			Help: "Requests atendidos por guardian, por app, ruta, método y status code.",
+		}, []string{"app", "route", "method", "code"}),
 		duration: f.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "guardian_http_request_duration_seconds",
 			Help:    "Latencia total del request dentro de guardian (incluye upstream).",
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
-		}, []string{"route", "method"}),
+		}, []string{"app", "route", "method"}),
 		inFlight: f.NewGauge(prometheus.GaugeOpts{
 			Name: "guardian_http_requests_in_flight",
 			Help: "Requests en curso en este momento.",
 		}),
 		decisions: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "guardian_decisions_total",
-			Help: "Decisiones del scorer por modo y si quedaron en shadow.",
-		}, []string{"decision", "mode", "shadow"}),
+			Help: "Decisiones del scorer por app, modo y si quedaron en shadow.",
+		}, []string{"app", "decision", "mode", "shadow"}),
 		signals: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "guardian_signals_total",
-			Help: "Veces que cada reason sumó al score.",
-		}, []string{"reason"}),
+			Help: "Veces que cada reason sumó al score, por app.",
+		}, []string{"app", "reason"}),
+		UnknownHost: f.NewCounter(prometheus.CounterOpts{
+			Name: "guardian_unknown_host_total",
+			Help: "Requests con un Host que no es de ninguna app (respondidos con 421).",
+		}),
 	}
 }
 
@@ -62,18 +71,26 @@ func (m *Metrics) Middleware(route RouteFunc) func(http.Handler) http.Handler {
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r)
 
+			// El label app sale del veredicto (lo puso middleware.App con el
+			// nombre validado de la config), NUNCA del Host crudo: así la
+			// cardinalidad es la cantidad de apps, no lo que invente un cliente.
+			v := verdict.From(r.Context())
+			app := "none"
+			if v != nil && v.App != "" {
+				app = v.App
+			}
 			rt, method := route(r.URL.Path), normMethod(r.Method)
-			m.requests.WithLabelValues(rt, method, strconv.Itoa(sw.status)).Inc()
-			m.duration.WithLabelValues(rt, method).Observe(time.Since(start).Seconds())
+			m.requests.WithLabelValues(app, rt, method, strconv.Itoa(sw.status)).Inc()
+			m.duration.WithLabelValues(app, rt, method).Observe(time.Since(start).Seconds())
 
-			if v := verdict.From(r.Context()); v != nil {
+			if v != nil {
 				mode := v.Mode
 				if mode == "" {
 					mode = "none"
 				}
-				m.decisions.WithLabelValues(v.Decision.String(), mode, strconv.FormatBool(v.Shadowed)).Inc()
+				m.decisions.WithLabelValues(app, v.Decision.String(), mode, strconv.FormatBool(v.Shadowed)).Inc()
 				for _, reason := range v.Reasons {
-					m.signals.WithLabelValues(reason).Inc()
+					m.signals.WithLabelValues(app, reason).Inc()
 				}
 			}
 		})

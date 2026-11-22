@@ -118,7 +118,7 @@ func handleKafka(ctx context.Context, cl *kgo.Client, agg applier, recs []*kgo.R
 		}
 	}
 	for _, mk := range marked {
-		log.Info("ja4_marcado", "ja4", mk.JA4, "distinct_ips", mk.DistinctIPs)
+		log.Info("ja4_marcado", "app", mk.App, "ja4", mk.JA4, "distinct_ips", mk.DistinctIPs)
 	}
 
 	// CommitRecords guarda, por partition, el offset del último record + 1.

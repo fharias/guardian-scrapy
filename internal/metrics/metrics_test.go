@@ -26,7 +26,7 @@ func TestMiddleware(t *testing.T) {
 	})
 	initMW := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r.WithContext(verdict.WithVerdict(r.Context(), &verdict.Verdict{})))
+			next.ServeHTTP(w, r.WithContext(verdict.WithVerdict(r.Context(), &verdict.Verdict{App: "shop"})))
 		})
 	}
 	srv := initMW(m.Middleware(func(string) string { return "/api" })(h))
@@ -35,21 +35,36 @@ func TestMiddleware(t *testing.T) {
 		srv.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(method, "/api/prices?id=1", nil))
 	}
 
-	if got := testutil.ToFloat64(m.requests.WithLabelValues("/api", "GET", "200")); got != 1 {
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("shop", "/api", "GET", "200")); got != 1 {
 		t.Fatalf("requests GET = %v, quiero 1", got)
 	}
-	if got := testutil.ToFloat64(m.requests.WithLabelValues("/api", "OTHER", "200")); got != 1 {
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("shop", "/api", "OTHER", "200")); got != 1 {
 		t.Fatalf("método inventado debe caer en OTHER, got %v", got)
 	}
-	if got := testutil.ToFloat64(m.decisions.WithLabelValues("challenge", "monitor", "true")); got != 2 {
+	if got := testutil.ToFloat64(m.decisions.WithLabelValues("shop", "challenge", "monitor", "true")); got != 2 {
 		t.Fatalf("decisions = %v, quiero 2", got)
 	}
-	if got := testutil.ToFloat64(m.signals.WithLabelValues("ja4_incoherente")); got != 2 {
+	if got := testutil.ToFloat64(m.signals.WithLabelValues("shop", "ja4_incoherente")); got != 2 {
 		t.Fatalf("signals = %v, quiero 2", got)
 	}
 	out, _ := testutil.CollectAndFormat(reg, expfmt.TypeTextPlain)
 	if strings.Contains(string(out), "id=1") {
 		t.Fatalf("label de alta cardinalidad filtrado:\n%s", out)
+	}
+}
+
+// Sin veredicto (o sin app) el label es "none": nunca vacío, nunca el Host.
+func TestMiddlewareSinApp(t *testing.T) {
+	m := New(prometheus.NewRegistry())
+	h := m.Middleware(func(string) string { return "default" })(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "lo-que-invente.example"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if got := testutil.ToFloat64(m.requests.WithLabelValues("none", "default", "GET", "200")); got != 1 {
+		t.Fatalf("requests{app=none} = %v", got)
+	}
+	if n := testutil.CollectAndCount(m.requests); n != 1 {
+		t.Fatalf("series = %d, want 1", n)
 	}
 }
 

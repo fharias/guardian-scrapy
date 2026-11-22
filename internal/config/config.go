@@ -41,6 +41,8 @@ type Config struct {
 	HoneypotPaths     []string      `yaml:"honeypot_paths"`
 
 	App                 string                `yaml:"app"`
+	Apps                []AppConfig           `yaml:"apps"`        // vacío = una sola app (App) para cualquier Host
+	DefaultApp          string                `yaml:"default_app"` // multi-app: quién atiende un Host desconocido ("" = 421)
 	RedisAddr           string                `yaml:"redis_addr"`
 	Rate                float64               `yaml:"rate"`
 	Burst               int                   `yaml:"burst"`
@@ -146,16 +148,20 @@ func (c *Config) Validate() error { return c.validate() }
 
 func (c *Config) validate() error {
 	var errs []error
-	if c.Upstream == "" {
-		errs = append(errs, errors.New("upstream es obligatorio"))
-	} else {
+	switch {
+	case c.Upstream != "":
 		u, err := url.Parse(c.Upstream)
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			errs = append(errs, fmt.Errorf("upstream %q debe ser una URL completa, ej. http://host:puerto", c.Upstream))
 		} else {
 			c.UpstreamURL = u
 		}
+	case !c.MultiApp():
+		errs = append(errs, errors.New("upstream es obligatorio"))
+		// Con apps, el global es opcional: validateApps exige upstream a cada
+		// app que no tenga el suyo.
 	}
+	errs = append(errs, c.validateApps()...)
 	if c.ReadHeaderTimeout <= 0 {
 		errs = append(errs, errors.New("read_header_timeout debe ser mayor que 0"))
 	}

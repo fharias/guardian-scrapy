@@ -35,6 +35,7 @@ func Middleware(sink EventSink, hasher *Hasher, route RouteFunc) func(http.Handl
 			}
 			ev := Event{
 				Time:        time.Now().UTC(),
+				App:         v.App,
 				IPHash:      hasher.Hash(v.ClientIP),
 				JA4:         v.JA4,
 				JA4Source:   v.JA4Source,

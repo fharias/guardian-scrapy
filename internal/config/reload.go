@@ -19,17 +19,19 @@ import (
 // Si agregas una ruta aquí, agrégala también en MergeReloadable; el test
 // TestMergeReloadableCubreLaLista falla si se te olvida.
 var Reloadable = []string{
-	"scoring",   // pesos, umbrales y browser_ratio_min
-	"rules",     // honeypots, deny_cidrs y allowlists por ruta
-	"modes",     // monitor/enforce por ruta
-	"ja4.tools", // JA4 conocidos de herramientas
+	"scoring",     // pesos, umbrales y browser_ratio_min
+	"rules",       // honeypots, deny_cidrs y allowlists por ruta
+	"modes",       // monitor/enforce por ruta
+	"ja4.tools",   // JA4 conocidos de herramientas
+	"apps",        // hosts, upstream, rate/burst y política de cada app
+	"default_app", // quién atiende un Host desconocido
 }
 
-// IsReloadable dice si la ruta YAML (ej. "scoring.weights.ua_tool") está
-// cubierta por alguna entrada de Reloadable.
+// IsReloadable dice si la ruta YAML (ej. "scoring.weights.ua_tool" o
+// "apps[api].modes.default") está cubierta por alguna entrada de Reloadable.
 func IsReloadable(path string) bool {
 	for _, p := range Reloadable {
-		if path == p || strings.HasPrefix(path, p+".") {
+		if path == p || strings.HasPrefix(path, p+".") || strings.HasPrefix(path, p+"[") {
 			return true
 		}
 	}
@@ -46,6 +48,8 @@ func MergeReloadable(running, incoming *Config) *Config {
 	merged.Rules = incoming.Rules
 	merged.Modes = incoming.Modes
 	merged.JA4.Tools = incoming.JA4.Tools
+	merged.Apps = incoming.Apps
+	merged.DefaultApp = incoming.DefaultApp
 	return &merged
 }
 
@@ -91,6 +95,10 @@ func Paths(changes []Change) []string {
 var durationType = reflect.TypeOf(time.Duration(0))
 
 func diffValue(path string, a, b reflect.Value, out *[]Change) {
+	if path == "apps" {
+		diffApps(a.Interface().([]AppConfig), b.Interface().([]AppConfig), out)
+		return
+	}
 	if a.Kind() == reflect.Pointer {
 		if a.IsNil() || b.IsNil() {
 			if a.IsNil() != b.IsNil() {
@@ -149,4 +157,30 @@ func format(path string, v reflect.Value) string {
 		return fmt.Sprintf("%q", v.String())
 	}
 	return fmt.Sprintf("%v", v.Interface())
+}
+
+// diffApps compara las apps POR NOMBRE, no por posición: reordenar el YAML no
+// es un cambio, y el log dice "apps[api].modes.default" en vez de volcar el
+// slice entero (con punteros) en una sola línea.
+func diffApps(a, b []AppConfig, out *[]Change) {
+	old := make(map[string]AppConfig, len(a))
+	for _, x := range a {
+		old[x.Name] = x
+	}
+	seen := make(map[string]bool, len(b))
+	for _, y := range b {
+		seen[y.Name] = true
+		path := "apps[" + y.Name + "]"
+		x, ok := old[y.Name]
+		if !ok {
+			*out = append(*out, Change{Path: path, Old: "(no existe)", New: fmt.Sprintf("hosts=%v", y.Hosts)})
+			continue
+		}
+		diffValue(path, reflect.ValueOf(x), reflect.ValueOf(y), out)
+	}
+	for _, x := range a {
+		if !seen[x.Name] {
+			*out = append(*out, Change{Path: "apps[" + x.Name + "]", Old: fmt.Sprintf("hosts=%v", x.Hosts), New: "(eliminada)"})
+		}
+	}
 }
