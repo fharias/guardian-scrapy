@@ -10,7 +10,7 @@ Proxy inverso en Go. Resuelve la IP del cliente, junta señales de la petición 
 
 `guardian` escucha HTTP en `:8080`. Con el bloque `tls` del ejemplo, también escucha HTTPS en `:8443`. Con `proxy_protocol` activo, cada listener solo acepta conexiones de `trusted_proxies` y les exige la cabecera PROXY; el plazo para leerla es de 2 segundos. En HTTPS el orden es TCP, cabecera PROXY si aplica, captura del ClientHello y luego TLS 1.2 como mínimo. `GET /healthz`, `GET /readyz` y `POST /__guardian/verify` salen antes de la cadena protegida. El resto entra en esa cadena. `allow`, y `challenge` con un pase válido, siguen al upstream. Las métricas de Prometheus van en otro puerto. Con `tracing.enabled`, los spans de la cadena protegida salen por OTLP/HTTP.
 
-Sin la sección `apps`, el campo `app` es la única aplicación y atiende cualquier `Host`. Con `apps`, la resolución es la de `apps.Router`: un lookup del `Host` y la cadena de esa app. `cmd/guardian` todavía publica en `/` una sola cadena, armada con `app` y el upstream global. El snapshot de hoy no es ese router, así que un `Host` distinto sigue la misma cadena y `guardian_unknown_host_total` se queda en 0.
+Sin la sección `apps`, el campo `app` es la única aplicación y atiende cualquier `Host`. Con `apps`, `chainDeps.build` publica un `apps.Router`: un lookup del `Host` y la cadena de esa app. Un `Host` que no coincide responde `421` y suma `guardian_unknown_host_total`.
 
 ```mermaid
 flowchart TD
@@ -28,9 +28,9 @@ flowchart TD
   nadie --> def["o la cadena de default_app"]
 ```
 
-`NormalizeHost` quita el puerto, el punto final y pasa a minúsculas. `API.local:8080` queda en `api.local`. Si el `Host` ya viene en minúsculas, esa función no asigna memoria. Con mayúsculas, una sola copia. Un nombre de más de 253 caracteres no se busca. La precedencia es host exacto, después el comodín de sufijo más largo, después `default_app`. `*.shop.local` cubre `a.shop.local` y no cubre `shop.local`. El IDNA a punycode corre al cargar la config. El lookup del request no lo vuelve a hacer. Sin `default_app`, el cuerpo del 421 es `host desconocido` y `Cache-Control` es `no-store`. El contador no lleva el `Host`: lo escribe el cliente.
+`NormalizeHost` quita el puerto, el punto final y pasa a minúsculas. `API.local:8080` queda en `api.local`. Si el `Host` ya viene en minúsculas, esa función no asigna memoria. Con mayúsculas, una sola copia. Un nombre de más de 253 caracteres no se busca. La precedencia es host exacto, después el comodín de sufijo más largo, después `default_app`. `*.shop.local` cubre `a.shop.local` y no cubre `shop.local`. El IDNA a punycode corre al cargar la config. El lookup del request no lo vuelve a hacer. Sin `default_app`, el cuerpo del 421 es `host desconocido` y `Cache-Control` es `no-store`. El log deja `host_desconocido` en debug, con el `Host` recortado a 255 caracteres. El contador no lleva el `Host`: lo escribe el cliente.
 
-Cada app hereda una sección entera del YAML superior cuando no la escribe. `scoring`, `rules` y `modes` no se mezclan campo a campo. `rate` y `burst` en 0 heredan. `upstream` vacío hereda. El nombre es `[a-z0-9-]`, empieza por letra o dígito y mide como máximo 32. Un host repetido, un comodín sobre una IP o un `default_app` que no está en `apps` fallan la carga. `apps` y `default_app` se recargan en caliente. El nombre de la app queda en `middleware.App`, justo después de `Init`, y de ahí lo leen el límite de tasa, la ACL, la reputación, las métricas, los eventos y el log. `internal/ratelimit.Pool` guarda un store por app y lo conserva entre recargas cuando `rate` y `burst` no cambian. El proceso de hoy crea un solo store con el `app` y el rate globales.
+Cada app hereda una sección entera del YAML superior cuando no la escribe. `scoring`, `rules` y `modes` no se mezclan campo a campo. `rate` y `burst` en 0 heredan. `upstream` vacío hereda. El nombre es `[a-z0-9-]`, empieza por letra o dígito y mide como máximo 32. Un host repetido, un comodín sobre una IP o un `default_app` que no está en `apps` fallan la carga. `apps` y `default_app` se recargan en caliente. El nombre de la app queda en `middleware.App`, justo después de `Init`, y de ahí lo leen el límite de tasa, la ACL, la reputación, las métricas, los eventos y el log. `internal/ratelimit.Pool` guarda un store por app y lo conserva entre recargas cuando `rate` y `burst` no cambian. El circuit breaker y los buckets locales sobreviven esa recarga.
 
 ```bash
 cd deploy/compose
@@ -461,14 +461,16 @@ internal/metrics/             RED, decisiones y señales de Prometheus
 internal/middleware/          cadena, señales, desafío, modo y spans
 internal/tracing/             OTLP/HTTP, muestreo y Traceparent hacia el upstream
 internal/policy/              monitor o enforce por prefijo; label route
-internal/ratelimit/           Valkey, memoria y failover
+internal/ratelimit/           Valkey, memoria, failover y un store por app
 internal/reputation/          HyperLogLog por JA4 y la marca que lee el proxy
 internal/rules/               honeypots, denegaciones y rutas
 internal/scoring/             pesos, umbrales y decisión
+internal/testutil/            contenedor de Valkey para tests con -tags=integration
 internal/tlshello/            ClientHello y cálculo del JA4
 internal/verdict/             IP, huella, señales y decisión
 guardian-config.yml           ejemplo para go run, con TLS en :8443
 deploy/compose/               stack local: guardian, upstream, Valkey, Jaeger, Prometheus y Grafana
+scripts/ci-local.sh           formato, vet, race, fuzz y, si se pide, integración
 Dockerfile                    imagen distroless de guardian o del upstream
 ```
 
@@ -508,7 +510,29 @@ La región, el endpoint y las credenciales de SQS y Kinesis salen de `AWS_REGION
 ## Requisitos
 
 - Go 1.27 o superior
-- Docker, para Valkey y Jaeger sueltos, y Docker Compose para el stack de `deploy/compose`
+- Docker, para Valkey y Jaeger sueltos, Docker Compose para el stack de `deploy/compose`, y los tests con `-tags=integration`
+
+## Pruebas
+
+`./scripts/ci-local.sh` corre lo mismo que el job de GitHub Actions. Desde la raíz del repositorio:
+
+```bash
+./scripts/ci-local.sh
+INTEGRATION=1 ./scripts/ci-local.sh
+FUZZTIME=2m ./scripts/ci-local.sh
+```
+
+El script exige `gofmt -l` vacío, `go vet` también con `-tags=integration`, y `go test -race -shuffle=on -count=1 ./...`. Después corre cada fuzzer 20 segundos. `FUZZTIME` cambia esa duración. `INTEGRATION=1` exige que Docker responda y corre `go test -race -count=1 -tags=integration` en `internal/ratelimit` y `internal/reputation`.
+
+Esos tests levantan `valkey/valkey:8` con testcontainers y lo destruyen al terminar. El tag `integration` deja a testcontainers fuera de `go test` y del build normal. Sin Docker, el test falla con `no pude levantar valkey`.
+
+| Fuzzer | Paquete | Qué exige |
+| --- | --- | --- |
+| `FuzzVerify` | `internal/challenge` | Un token arbitrario no causa panic. Uno válido tiene cuatro partes. Lo firmado se recupera igual, vence con `ErrExpired` y una firma alterada da `ErrBadSig` |
+| `FuzzClientIP` | `internal/clientip` | Un `RemoteAddr` roto deja la IP inválida. Un peer que no es proxy de confianza no cambia su IP con `X-Forwarded-For` |
+| `FuzzProxyProtoRead` | `cmd/guardian` | Bytes arbitrarios de PROXY protocol no causan panic. Una cabecera que se puede escribir se vuelve a leer igual |
+
+`cmd/guardian/build_test.go` arma la cadena real con `chainDeps.build`, sin levantar el proceso, y comprueba el ruteo de varias apps y el 421.
 
 ## Configuración
 
@@ -756,7 +780,7 @@ El método se normaliza a `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` u `OPT
 | `guardian_http_requests_in_flight` | gauge | — | Peticiones que aún no han vuelto del resto de la cadena |
 | `guardian_decisions_total` | counter | `app`, `decision`, `mode`, `shadow` | Decisión leída del veredicto. `shadow` vale `true` o `false`. Un modo vacío queda en `none` |
 | `guardian_signals_total` | counter | `app`, `reason` | Cada motivo que el veredicto trae en `Reasons` |
-| `guardian_unknown_host_total` | counter | — | Hosts que `apps.Router` responde con 421. El binario de hoy no lo incrementa |
+| `guardian_unknown_host_total` | counter | — | Hosts que `apps.Router` responde con 421. El log de ese caso es `host_desconocido` en debug |
 | `guardian_fail_open_total` | counter | `reason` | Saltos al limitador en memoria: `timeout`, `error` o `circuit_open` |
 | `guardian_events_enqueued_total` | counter | — | Eventos que entraron al buffer |
 | `guardian_events_dropped_total` | counter | `reason` | Descartados: `buffer_full` o `closed`. Las dos series existen desde el arranque |
