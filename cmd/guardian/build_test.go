@@ -398,14 +398,17 @@ apps:
 	}
 	time.Sleep(20 * time.Millisecond)
 
+	// La carga concurrente para antes de mover el host: después de esta
+	// recarga api.local responde 403 (enforce), que la carga no espera.
+	close(stop)
+	wg.Wait()
+
 	// Mover un host de app: api.local pasa a shop (enforce).
 	s.reload(fmt.Sprintf(baseYAML, s.shopURL) + `
 apps:
   - name: shop
     hosts: ["shop.local", "api.local"]
 `)
-	close(stop)
-	wg.Wait()
 	if rec := s.do("api.local", "203.0.113.62", false); rec.Code != http.StatusForbidden {
 		t.Fatalf("api.local ahora es de shop (enforce) = %d, want 403", rec.Code)
 	}

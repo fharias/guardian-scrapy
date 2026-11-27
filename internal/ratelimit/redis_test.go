@@ -7,32 +7,19 @@ import (
 	"testing"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/fharias/guardian-scrapy/internal/testutil"
 )
 
 func TestRedisStoreTokenBucket(t *testing.T) {
 	ctx := context.Background()
-	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "valkey/valkey:8",
-			ExposedPorts: []string{"6379/tcp"},
-			WaitingFor:   wait.ForLog("Ready to accept connections"),
-		},
-		Started: true,
-	})
-	if err != nil {
-		t.Fatalf("no pude levantar valkey: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Terminate(ctx) })
-	addr, err := c.Endpoint(ctx, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	rdb := redis.NewClient(&redis.Options{Addr: testutil.Valkey(t)})
 	t.Cleanup(func() { _ = rdb.Close() })
+
 	runContract(t, func(t *testing.T) RateStore {
-		rdb.FlushAll(ctx)
+		if err := rdb.FlushAll(ctx).Err(); err != nil {
+			t.Fatal(err)
+		}
 		return NewRedisStore(rdb, "test", 1, 2)
 	})
 }

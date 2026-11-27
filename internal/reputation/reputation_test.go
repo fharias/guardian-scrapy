@@ -68,6 +68,14 @@ func TestAggregatorPorApp(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer rdb.Close()
+	runAggregatorPorApp(t, rdb)
+}
+
+// runAggregatorPorApp es el escenario compartido: corre igual contra
+// miniredis (go test normal) y contra Valkey real (-tags=integration).
+func runAggregatorPorApp(t *testing.T, rdb *redis.Client) {
+	t.Helper()
+	ctx := context.Background()
 	const ja4 = "t13d1516h2_8daaf6152771_02713d6af862"
 	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
 	agg := NewAggregator(rdb, "shop", Config{Enabled: true, MinDistinctIPs: 3})
@@ -76,7 +84,7 @@ func TestAggregatorPorApp(t *testing.T) {
 	ev := func(app, ip string) events.Event {
 		return events.Event{Time: now, App: app, IPHash: ip, JA4: ja4}
 	}
-	marked, err := agg.Apply(context.Background(), []events.Event{
+	marked, err := agg.Apply(ctx, []events.Event{
 		ev("api", "a"), ev("api", "b"), ev("api", "c"), // 3 IPs en api: marca
 		ev("shop", "a"), ev("", "b"), // 2 en shop (una sin app -> shop): no marca
 		ev("Mal:Nombre", "z"), // inválido -> shop: ahora son 3 en shop
@@ -91,7 +99,11 @@ func TestAggregatorPorApp(t *testing.T) {
 	if got["api"] != 3 || got["shop"] != 3 || len(got) != 2 {
 		t.Fatalf("marked = %+v", marked)
 	}
-	for _, k := range mr.Keys() {
+	keys, err := rdb.Keys(ctx, "*").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
 		if !strings.HasPrefix(k, "gd:shop:") && !strings.HasPrefix(k, "gd:api:") {
 			t.Errorf("llave fuera de prefijo: %s", k)
 		}
@@ -101,13 +113,13 @@ func TestAggregatorPorApp(t *testing.T) {
 	}
 
 	r := NewReader(rdb, Config{Enabled: true, CacheTTL: time.Minute})
-	if bad, _, _ := r.Bad(context.Background(), "api", ja4); !bad {
+	if bad, _, _ := r.Bad(ctx, "api", ja4); !bad {
 		t.Fatal("api debe ver la marca")
 	}
-	if bad, _, _ := r.Bad(context.Background(), "blog", ja4); bad {
+	if bad, _, _ := r.Bad(ctx, "blog", ja4); bad {
 		t.Fatal("blog no tiene marca: la caché no puede mezclar apps")
 	}
-	if bad, _, _ := r.Bad(context.Background(), "a:b", ja4); bad {
+	if bad, _, _ := r.Bad(ctx, "a:b", ja4); bad {
 		t.Fatal("app inválida = sin reputación")
 	}
 }
