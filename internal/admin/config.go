@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fharias/guardian-scrapy/internal/acl"
@@ -82,6 +83,18 @@ func (c Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+// blockProfileNS es la tasa, en nanosegundos, que este paquete dejó en el
+// runtime. SetBlockProfileRate no devuelve el valor anterior: lo convierte a
+// ciclos de CPU y no hay forma de leerlo. El proceso arranca en 0. Cada
+// ApplyProfiling guarda la tasa previa y su restore la vuelve a escribir, para
+// que un test no borre la que dejó el test anterior.
+var (
+	blockProfileMu sync.Mutex
+	blockProfileNS int
+	// setBlockProfileRate es el punto que los tests sustituyen.
+	setBlockProfileRate = runtime.SetBlockProfileRate
+)
+
 // ApplyProfiling enciende los perfiles mutex y block del runtime SOLO si la
 // Admin API está habilitada y el valor es > 0. Con 0 no toca nada: ni
 // apaga lo que otro ya haya encendido. Devuelve una función que deja el
@@ -95,10 +108,16 @@ func (c Config) ApplyProfiling() (restore func()) {
 		// SetMutexProfileFraction devuelve el valor anterior.
 		prevMutex = runtime.SetMutexProfileFraction(c.MutexProfileFraction)
 	}
+	prevBlock := 0
 	changedBlock := false
 	if c.BlockProfileRate > 0 {
 		// El parámetro es en nanosegundos. 1ms = ~1 muestra por cada ms bloqueado.
-		runtime.SetBlockProfileRate(int(c.BlockProfileRate.Nanoseconds()))
+		ns := int(c.BlockProfileRate.Nanoseconds())
+		blockProfileMu.Lock()
+		prevBlock = blockProfileNS
+		setBlockProfileRate(ns)
+		blockProfileNS = ns
+		blockProfileMu.Unlock()
 		changedBlock = true
 	}
 	return func() {
@@ -106,7 +125,10 @@ func (c Config) ApplyProfiling() (restore func()) {
 			runtime.SetMutexProfileFraction(prevMutex)
 		}
 		if changedBlock {
-			runtime.SetBlockProfileRate(0) // el runtime no expone el valor anterior; el default es 0
+			blockProfileMu.Lock()
+			setBlockProfileRate(prevBlock)
+			blockProfileNS = prevBlock
+			blockProfileMu.Unlock()
 		}
 	}
 }

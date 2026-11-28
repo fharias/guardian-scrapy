@@ -18,6 +18,24 @@ func TestApplyProfilingApagadoPorDefecto(t *testing.T) {
 
 func TestApplyProfilingEnciendeYRestaura(t *testing.T) {
 	before := runtime.SetMutexProfileFraction(-1)
+
+	// Una tasa distinta de 0, como la que dejaría un test anterior.
+	// El runtime no deja leerla; el spy comprueba que restore no la pisa con 0.
+	const previo = int(2 * time.Millisecond)
+	blockProfileMu.Lock()
+	savedNS := blockProfileNS
+	blockProfileNS = previo
+	blockProfileMu.Unlock()
+	var calls []int
+	origSet := setBlockProfileRate
+	setBlockProfileRate = func(rate int) { calls = append(calls, rate) }
+	t.Cleanup(func() {
+		setBlockProfileRate = origSet
+		blockProfileMu.Lock()
+		blockProfileNS = savedNS
+		blockProfileMu.Unlock()
+	})
+
 	cfg := Config{Enabled: true, MutexProfileFraction: 7, BlockProfileRate: time.Millisecond}
 	restore := cfg.ApplyProfiling()
 	if got := runtime.SetMutexProfileFraction(-1); got != 7 {
@@ -26,6 +44,9 @@ func TestApplyProfilingEnciendeYRestaura(t *testing.T) {
 	restore()
 	if got := runtime.SetMutexProfileFraction(-1); got != before {
 		t.Fatalf("restore: fraction = %d, want %d", got, before)
+	}
+	if len(calls) != 2 || calls[0] != int(time.Millisecond) || calls[1] != previo {
+		t.Fatalf("block rate = %v, want [%d %d]", calls, int(time.Millisecond), previo)
 	}
 }
 
