@@ -1,5 +1,7 @@
 # Guardian - Enterprise Anti-scraping reverse proxy
 
+[English](README.en.md)
+
 ![guardian](docs/banner.jpg)
 
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go) ![AWS](https://img.shields.io/badge/AWS-ready-FF9900?logo=amazonaws)
@@ -481,6 +483,7 @@ guardian-config.yml           ejemplo para go run, con TLS en :8443
 deploy/compose/               stack local: guardian, upstream, Valkey, Jaeger, Prometheus y Grafana
 scripts/ci-local.sh           formato, vet, race, fuzz y, si se pide, integración
 scripts/k6/                   carga con k6: proxy y upstream directo
+README.en.md                  esta documentación, en inglés
 Dockerfile                    imagen distroless de guardian o del upstream
 ```
 

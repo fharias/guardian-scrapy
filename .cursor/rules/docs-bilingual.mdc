@@ -1,0 +1,15 @@
+---
+description: Keep the Spanish README and the English README in sync
+alwaysApply: true
+---
+
+# Bilingual documentation
+
+`README.md` is Spanish. `README.en.md` is the English copy of the same document.
+
+When a documentation update changes either file, apply the same facts to the other file in the same change. Keep code, commands, YAML, metric names, log messages, and Mermaid structure identical. Translate only the prose.
+
+Each file links to the other under the title:
+
+- `README.md`: `[English](README.en.md)`
+- `README.en.md`: `[Español](README.md)`
