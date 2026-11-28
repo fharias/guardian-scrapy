@@ -394,7 +394,15 @@ El token sale solo de `GUARDIAN_ADMIN_TOKEN`. No hay campo de token en el YAML: 
 export GUARDIAN_ADMIN_TOKEN="$(openssl rand -hex 32)"
 ```
 
-La API escucha en su propio proceso HTTP. `ReadHeaderTimeout` es 5 segundos, lectura y escritura 10 segundos, idle 60 segundos y el tope de cabeceras es 16 KiB. `admin.listen` vacío queda en `127.0.0.1:9091`. El puerto no puede coincidir con `listen`, `tls.listen` ni `:2112`. En Compose el proceso escucha en `:9091` dentro del contenedor y el host lo ve solo en `127.0.0.1:9091`. El apagado de esa API entra en el mismo `Shutdown` que HTTP y HTTPS.
+La API escucha en su propio proceso HTTP. `ReadHeaderTimeout` es 5 segundos, la lectura 10 segundos, la escritura 2 minutos, idle 60 segundos y el tope de cabeceras es 16 KiB. Esos 2 minutos cubren `GET /debug/pprof/profile`: el perfil de CPU por defecto dura 30 segundos y un `WriteTimeout` de 10 segundos lo cortaba a la mitad. `admin.listen` vacío queda en `127.0.0.1:9091`. El puerto no puede coincidir con `listen`, `tls.listen` ni `:2112`. En Compose el proceso escucha en `:9091` dentro del contenedor y el host lo ve solo en `127.0.0.1:9091`. El apagado de esa API entra en el mismo `Shutdown` que HTTP y HTTPS.
+
+`/debug/pprof/` vive en ese mismo mux, detrás del Bearer. `:8080` y `:2112` no lo sirven. Importar `net/http/pprof` también registra los perfiles en `http.DefaultServeMux`, y este proceso no escucha ese mux. Sin token la respuesta es `401`, igual que el resto de la API. Con token, el índice lista `heap`, `goroutine`, `allocs` y el resto. El perfil de CPU se pide con `seconds`. Un valor cerca de 2 minutos choca con el `WriteTimeout`.
+
+```bash
+curl -sH "Authorization: Bearer $GUARDIAN_ADMIN_TOKEN" \
+  "http://127.0.0.1:9091/debug/pprof/profile?seconds=30" > cpu.pb.gz
+go tool pprof cpu.pb.gz
+```
 
 Sin `Authorization: Bearer` válido la respuesta es `401`, con `WWW-Authenticate` y el cuerpo `no autorizado`, antes de mirar si la ruta existe. El log deja `admin_auth_fallida` con el motivo `sin_bearer` o `token_invalido` y no escribe el header. `X-Guardian-Actor` es una etiqueta del audit log, con tope de 64 caracteres. Vacío queda en `desconocido`. No autentica a nadie.
 
@@ -408,6 +416,7 @@ Sin `Authorization: Bearer` válido la respuesta es `401`, con `WWW-Authenticate
 | `DELETE` | la misma ruta de una entrada | `204` si la borró, `404` si no estaba |
 | `POST` | `/v1/reload` | La misma recarga que fsnotify y `SIGHUP`, con motivo `admin_api` |
 | `GET` | `/v1/config` | `version`, `loaded_at` y la lista `reloadable`. No devuelve valores del YAML |
+| `GET` | `/debug/pprof/` | Índice de perfiles. También `heap`, `profile`, `trace`, `cmdline` y `symbol` |
 
 `GET`, `PUT` y `DELETE` de una entrada existen en `/v1/{lista}/{kind}/{value}` y en `/v1/apps/{app}/{lista}/{kind}/{value}`.
 
@@ -533,6 +542,19 @@ Esos tests levantan `valkey/valkey:8` con testcontainers y lo destruyen al termi
 | `FuzzProxyProtoRead` | `cmd/guardian` | Bytes arbitrarios de PROXY protocol no causan panic. Una cabecera que se puede escribir se vuelve a leer igual |
 
 `cmd/guardian/build_test.go` arma la cadena real con `chainDeps.build`, sin levantar el proceso, y comprueba el ruteo de varias apps y el 421.
+
+`./scripts/ci-local.sh` no corre benchmarks. Estos miden el camino caliente y reportan allocations:
+
+```bash
+go test -bench=. -benchmem ./internal/clientip ./internal/fingerprint ./internal/scoring ./internal/apps
+```
+
+| Benchmark | Qué mide |
+| --- | --- |
+| `BenchmarkClientIP` | IP directa y una cadena `X-Forwarded-For` de un peer de confianza |
+| `BenchmarkCompute` | Huella de cabeceras de un Chrome |
+| `BenchmarkEvaluate` | `allow`, bot con varias señales, `DenyReason` y allowlist |
+| `BenchmarkLookup` | Host exacto, comodín y el mismo host con mayúsculas |
 
 ## Configuración
 
