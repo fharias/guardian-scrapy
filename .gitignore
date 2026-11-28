@@ -33,3 +33,4 @@ deploy/compose/certs/*
 deploy/compose/.env
 
 *.patch
+prof-*/

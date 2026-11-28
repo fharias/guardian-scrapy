@@ -130,8 +130,12 @@ func (d *chainDeps) buildApp(a config.App, ja4Policy *fingerprint.JA4Policy, ver
 // conexiones. Todos comparten http.DefaultTransport (Transport nil), así que
 // el pool de conexiones keep-alive hacia cada upstream sobrevive las recargas
 // aunque el ReverseProxy se cree de nuevo.
+//
+// BufferPool: sin él, ReverseProxy hace make([]byte, 32 KB) por respuesta. En
+// el perfil de carga del Reto 4 eso era el 49.8% de alloc_space.
 func newUpstreamProxy(target *url.URL, preserveHost bool) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
+		BufferPool: proxyBufferPool,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.SetXForwarded()

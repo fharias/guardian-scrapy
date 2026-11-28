@@ -6,6 +6,8 @@ import { check } from 'k6';
 // Sin Host: shop.local, apps responde 421 (el Host sería 127.0.0.1).
 const BASE_URL = __ENV.BASE_URL || 'http://127.0.0.1:8080';
 const HOST = __ENV.HOST || 'shop.local';
+// DURATION=90s para dejar tiempo a capturar perfiles (el Reto 4 pide ~40 s).
+const DURATION = __ENV.DURATION || '45s';
 
 const browserHeaders = {
   Host: HOST,
@@ -27,7 +29,7 @@ export const options = {
       executor: 'constant-arrival-rate',
       rate: 100,
       timeUnit: '1s',
-      duration: '45s',
+      duration: DURATION,
       preAllocatedVUs: 40,
       maxVUs: 80,
       exec: 'browser',
@@ -36,7 +38,7 @@ export const options = {
       executor: 'constant-arrival-rate',
       rate: 40,
       timeUnit: '1s',
-      duration: '45s',
+      duration: DURATION,
       preAllocatedVUs: 20,
       maxVUs: 40,
       exec: 'bot',

@@ -23,6 +23,27 @@ admin:
 	}
 }
 
+func TestAdminProfilingYAML(t *testing.T) {
+	cfg := mustParse(t, base+`
+admin:
+  enabled: true
+  listen: ":9091"
+  mutex_profile_fraction: 5
+  block_profile_rate: 1ms
+`)
+	if cfg.Admin.MutexProfileFraction != 5 || cfg.Admin.BlockProfileRate != time.Millisecond {
+		t.Fatalf("admin = %+v", cfg.Admin)
+	}
+	// Sin las claves, ambos quedan apagados (0).
+	off := mustParse(t, base+"admin:\n  enabled: true\n  listen: \":9091\"\n")
+	if off.Admin.MutexProfileFraction != 0 || off.Admin.BlockProfileRate != 0 {
+		t.Fatalf("default debe ser 0 (apagado): %+v", off.Admin)
+	}
+	if _, err := Parse([]byte(base + "admin:\n  enabled: true\n  mutex_profile_fraction: -1\n")); err == nil {
+		t.Fatal("fraction negativa debe fallar")
+	}
+}
+
 func TestAdminValidation(t *testing.T) {
 	cases := map[string]string{
 		"mismo puerto que el proxy": "admin:\n  enabled: true\n  listen: \"127.0.0.1:8080\"\n",

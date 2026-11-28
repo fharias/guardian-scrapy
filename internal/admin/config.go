@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"time"
 
@@ -34,6 +35,11 @@ type Config struct {
 	CacheTTL      time.Duration `yaml:"cache_ttl"`      // caché local de la ACL en cada réplica; default 2s
 	StaleTTL      time.Duration `yaml:"stale_ttl"`      // si Redis falla, cuánto sirve lo viejo; default 1m
 	LookupTimeout time.Duration `yaml:"lookup_timeout"` // presupuesto del GET por request; default 20ms
+
+	// Perfilado opt-in para /debug/pprof/mutex y /debug/pprof/block. El
+	// runtime los trae APAGADOS (cuestan CPU), por eso 0 = apagado.
+	MutexProfileFraction int           `yaml:"mutex_profile_fraction"` // 1 de cada N contenciones de mutex; 0 = off
+	BlockProfileRate     time.Duration `yaml:"block_profile_rate"`     // muestrea bloqueos de al menos este tiempo; 0 = off
 }
 
 func (c Config) WithDefaults() Config {
@@ -67,10 +73,42 @@ func (c Config) Validate() error {
 	if c.CacheTTL < 0 || c.LookupTimeout <= 0 {
 		errs = append(errs, errors.New("admin.cache_ttl no puede ser negativo y admin.lookup_timeout debe ser > 0"))
 	}
+	if c.MutexProfileFraction < 0 || c.BlockProfileRate < 0 {
+		errs = append(errs, errors.New("admin.mutex_profile_fraction y admin.block_profile_rate no pueden ser negativos (0 = apagado)"))
+	}
 	if c.StaleTTL < c.CacheTTL {
 		errs = append(errs, fmt.Errorf("admin.stale_ttl (%s) no puede ser menor que admin.cache_ttl (%s)", c.StaleTTL, c.CacheTTL))
 	}
 	return errors.Join(errs...)
+}
+
+// ApplyProfiling enciende los perfiles mutex y block del runtime SOLO si la
+// Admin API está habilitada y el valor es > 0. Con 0 no toca nada: ni
+// apaga lo que otro ya haya encendido. Devuelve una función que deja el
+// runtime como estaba (la usan los tests; main la ignora).
+func (c Config) ApplyProfiling() (restore func()) {
+	if !c.Enabled {
+		return func() {}
+	}
+	prevMutex := -1 // -1 = no la cambiamos
+	if c.MutexProfileFraction > 0 {
+		// SetMutexProfileFraction devuelve el valor anterior.
+		prevMutex = runtime.SetMutexProfileFraction(c.MutexProfileFraction)
+	}
+	changedBlock := false
+	if c.BlockProfileRate > 0 {
+		// El parámetro es en nanosegundos. 1ms = ~1 muestra por cada ms bloqueado.
+		runtime.SetBlockProfileRate(int(c.BlockProfileRate.Nanoseconds()))
+		changedBlock = true
+	}
+	return func() {
+		if prevMutex >= 0 {
+			runtime.SetMutexProfileFraction(prevMutex)
+		}
+		if changedBlock {
+			runtime.SetBlockProfileRate(0) // el runtime no expone el valor anterior; el default es 0
+		}
+	}
 }
 
 // ACLOptions traduce la config al Store de la ACL.

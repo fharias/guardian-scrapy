@@ -1,0 +1,36 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/fharias/guardian-scrapy/cmd/guardian
+cpu: Apple M3 Pro
+BenchmarkUpstreamProxy/body=256B-11         	   18570	     57961 ns/op	    7689 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   19933	     55663 ns/op	    7671 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   21859	     52281 ns/op	    7619 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   25066	     48303 ns/op	    7643 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   24241	     49055 ns/op	    7580 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   23230	     52693 ns/op	    7630 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   24482	     50019 ns/op	    7644 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   24915	     48355 ns/op	    7602 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   25032	     51571 ns/op	    7579 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=256B-11         	   24895	     48605 ns/op	    7619 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   22987	     51756 ns/op	    7689 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   23263	     51304 ns/op	    7745 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   23596	     51376 ns/op	    7669 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   22854	     52221 ns/op	    7727 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   23138	     52673 ns/op	    7744 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   23397	     52775 ns/op	    7701 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   23060	     53643 ns/op	    7710 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   23643	     50668 ns/op	    7737 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   23199	     51184 ns/op	    7675 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=16384B-11       	   22670	     51464 ns/op	    7649 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   21208	     56589 ns/op	    7689 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   20947	     56955 ns/op	    7685 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   20562	     58266 ns/op	    7698 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   20288	     62952 ns/op	    7689 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   19582	     59780 ns/op	    7726 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   20790	     58496 ns/op	    7719 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   19170	     61924 ns/op	    7657 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   19797	     59608 ns/op	    7678 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   21235	     56637 ns/op	    7724 B/op	      85 allocs/op
+BenchmarkUpstreamProxy/body=65536B-11       	   21013	     56709 ns/op	    7705 B/op	      85 allocs/op
+PASS
+ok  	github.com/fharias/guardian-scrapy/cmd/guardian	36.511s

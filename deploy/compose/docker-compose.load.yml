@@ -5,6 +5,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.load.yml up -d --build
 #   docker compose -f docker-compose.yml -f docker-compose.load.yml --profile load run --rm k6
 #   docker compose -f docker-compose.yml -f docker-compose.load.yml --profile load run --rm k6 run /scripts/upstream.js
+#   DURATION=90s docker compose ... --profile load run --rm k6    (carga más larga, Reto 4)
 #
 # El directorio ./config ya viene montado desde docker-compose.yml.
 # k6, en la red de compose, habla con guardian:8080 y upstream:9000.
@@ -17,6 +18,10 @@ services:
 
   guardian:
     command: ["-config", "/etc/guardian/guardian.load.yml"]
+    environment:
+      # Reto 4: GODEBUG=gctrace=1 docker compose ... up -d  imprime una línea
+      # "gc N @..." por cada GC en los logs. Vacío = sin efecto.
+      GODEBUG: ${GODEBUG:-}
 
   k6:
     profiles: ["load"]
@@ -28,6 +33,7 @@ services:
       BASE_URL: http://guardian:8080
       UPSTREAM_URL: http://upstream:9000
       HOST: shop.local
+      DURATION: ${DURATION:-45s}   # Reto 4: DURATION=90s docker compose ... run --rm k6
     depends_on:
       guardian: { condition: service_started }
       upstream: { condition: service_started }

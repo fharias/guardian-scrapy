@@ -63,6 +63,10 @@ admin:
   cache_ttl: 2s
   stale_ttl: 1m
   lookup_timeout: 20ms
+  # Reto 4: perfiles mutex y block para /debug/pprof/mutex y /block.
+  # Cuestan CPU: en producción déjalos en 0 (apagado).
+  mutex_profile_fraction: 5   # registra 1 de cada 5 contenciones de mutex
+  block_profile_rate: 1ms     # muestrea bloqueos de 1ms o más
 # Sin default_app: k6 tiene que mandar Host: shop.local.
 # Si usas 127.0.0.1 como Host, recibes 421.
 apps:

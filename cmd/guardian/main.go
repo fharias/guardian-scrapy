@@ -64,6 +64,10 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Perfiles mutex/block de /debug/pprof: apagados salvo que admin.enabled sea
+	// true y el YAML ponga admin.mutex_profile_fraction o admin.block_profile_rate.
+	cfg.Admin.ApplyProfiling()
+
 	var ready atomic.Bool
 	ready.Store(true)
 
@@ -285,7 +289,9 @@ func main() {
 		}
 		logger.Info("admin", "enabled", true, "addr", adminSrv.Addr,
 			"max_ttl", cfg.Admin.MaxTTL.String(), "cache_ttl", cfg.Admin.CacheTTL.String(),
-			"stale_ttl", cfg.Admin.StaleTTL.String())
+			"stale_ttl", cfg.Admin.StaleTTL.String(),
+			"mutex_profile_fraction", cfg.Admin.MutexProfileFraction,
+			"block_profile_rate", cfg.Admin.BlockProfileRate.String())
 		go func() {
 			if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("servidor admin", "err", err)
