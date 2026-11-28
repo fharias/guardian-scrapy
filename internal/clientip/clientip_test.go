@@ -1,6 +1,7 @@
 package clientip
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 )
@@ -56,6 +57,34 @@ func TestPeerIsTrusted(t *testing.T) {
 			req.RemoteAddr = tc.remote
 			if got := r.PeerIsTrusted(req); got != tc.want {
 				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func BenchmarkClientIP(b *testing.B) {
+	r, err := New([]string{"10.0.0.0/8", "::1/128", "127.0.0.0/8"}, "X-Forwarded-For")
+	if err != nil {
+		b.Fatal(err)
+	}
+	direct := httptest.NewRequest("GET", "/", nil)
+	direct.RemoteAddr = "203.0.113.7:5000"
+	xff := httptest.NewRequest("GET", "/", nil)
+	xff.RemoteAddr = "10.0.1.5:5000"
+	xff.Header.Set("X-Forwarded-For", "198.51.100.9, 10.0.2.8")
+
+	for _, tc := range []struct {
+		name string
+		req  *http.Request
+	}{
+		{"direct", direct},
+		{"xff", xff},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			req := tc.req
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = r.ClientIP(req)
 			}
 		})
 	}

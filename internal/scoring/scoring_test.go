@@ -69,3 +69,28 @@ func TestNewRejectsBadThresholds(t *testing.T) {
 		t.Fatal("esperaba error con challenge >= block")
 	}
 }
+
+func BenchmarkEvaluate(b *testing.B) {
+	s, err := New(testConfig())
+	if err != nil {
+		b.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		sig  verdict.Signals
+	}{
+		{"allow", verdict.Signals{}},
+		{"bot", verdict.Signals{UATool: true, HeadersIncomplete: true, JA4Mismatch: true}},
+		{"deny", verdict.Signals{DenyReason: "ip_denegada"}},
+		{"allowlist", verdict.Signals{Allowlisted: true, UATool: true}},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			sig := tc.sig
+			b.ReportAllocs()
+			for b.Loop() {
+				_, _, _ = s.Evaluate(sig)
+			}
+		})
+	}
+}

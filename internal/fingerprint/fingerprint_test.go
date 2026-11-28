@@ -56,3 +56,11 @@ func TestFingerprintCompute(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkCompute(b *testing.B) {
+	h := chrome()
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = Compute(h)
+	}
+}
