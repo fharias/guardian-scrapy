@@ -480,6 +480,7 @@ internal/verdict/             IP, huella, señales y decisión
 guardian-config.yml           ejemplo para go run, con TLS en :8443
 deploy/compose/               stack local: guardian, upstream, Valkey, Jaeger, Prometheus y Grafana
 scripts/ci-local.sh           formato, vet, race, fuzz y, si se pide, integración
+scripts/k6/                   carga con k6: proxy y upstream directo
 Dockerfile                    imagen distroless de guardian o del upstream
 ```
 
@@ -511,6 +512,7 @@ Estos servicios no viven dentro del binario. Compose los levanta al lado de guar
 | ![Amazon Kinesis](https://img.shields.io/badge/Kinesis-FF9900) | Amazon Kinesis | Sink `events.sink: kinesis`. `PutRecords` usa el JA4 como partition key y, si no hay, `ip_hash` |
 | ![Apache Kafka](https://img.shields.io/badge/Kafka-231F20?logo=apachekafka&logoColor=white) | Apache Kafka `4.4.0` | Sink `events.sink: kafka` y el aggregator. En local, un broker KRaft. En AWS, el mismo cliente habla con MSK |
 | ![Floci](https://img.shields.io/badge/Floci-111111) | Floci `2.4.0` | AWS local del perfil `aws`, en `127.0.0.1:4566`. Crea la cola y el stream `guardian-events` |
+| ![k6](https://img.shields.io/badge/k6-2.4-7D64FF?logo=k6&logoColor=white) | Grafana k6 `2.4.0` | Carga del perfil `load`. Compara el proxy con el upstream directo |
 | ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white) | Docker Compose | Stack de `deploy/compose`: proxy, upstream, Valkey, Jaeger, Prometheus, Grafana y, con el perfil `aws`, Floci |
 | ![Alpine](https://img.shields.io/badge/Alpine-0D597F?logo=alpinelinux&logoColor=white) ![Distroless](https://img.shields.io/badge/Distroless-4285F4?logo=googlecloud&logoColor=white) | Alpine y Distroless | La imagen compila con `golang:1.27.4-alpine` y corre en `gcr.io/distroless/static-debian13:nonroot` |
 
@@ -922,7 +924,7 @@ Los puertos publicados escuchan solo en `127.0.0.1`:
 | Grafana | `3000` | UI. El alta de usuarios está cerrada |
 | Floci | `4566` | Solo con el perfil `aws`. Emulador en `127.0.0.1`, sin autenticación real |
 
-`:2112`, el OTLP `:4318`, Valkey `:6379` y el upstream `:9000` se quedan en la red de Compose. Prometheus lee `guardian:2112` cada 15 segundos, evalúa las reglas cada 15 segundos y guarda 7 días en el volumen `prom-data`.
+`:2112`, el OTLP `:4318` y Valkey `:6379` se quedan en la red de Compose. El upstream `:9000` también, salvo el override de carga, que lo publica en `127.0.0.1:9000`. Prometheus lee `guardian:2112` cada 15 segundos, evalúa las reglas cada 15 segundos y guarda 7 días en el volumen `prom-data`.
 
 ```mermaid
 flowchart LR
@@ -990,6 +992,30 @@ Para mirar la cola y el stream sin instalar el AWS CLI, esta función corre el C
 awsl() { docker compose --profile aws run --rm -T --no-deps --entrypoint aws aws-init --endpoint-url http://floci:4566 "$@"; }
 awsl sqs list-queues
 awsl kinesis list-streams
+```
+
+### Carga
+
+`docker-compose.load.yml` y `config/guardian.load.yml` miden el camino `allow`, no el límite de tasa. El YAML apunta Valkey a `valkey:6379`, deja `rate` y `burst` en 100000, apaga los eventos y muestrea el 1 % de las trazas. El log `request` sigue en Info. `admin.enabled` queda en verdadero, así que el `.env` del compose base sigue haciendo falta.
+
+Hay dos apps y no hay `default_app`. k6 manda `Host: shop.local`. Un `Host` `127.0.0.1` recibe `421`. `shop` hereda `enforce`. `api.local` está en `monitor` y estos scripts no lo llaman. La carga es HTTP, así que `ja4.source: tls` no calcula JA4. El navegador trae `User-Agent` de Chrome y las cabeceras `Accept`, y el umbral lo deja en `200`. `curl/8.5.0` suma `ua_herramienta` (90) y, con umbral de bloqueo 85, recibe `403`.
+
+k6 es la imagen `grafana/k6:2.4.0` y solo arranca con el perfil `load`. Dentro de la red usa `http://guardian:8080` y `http://upstream:9000`. `load.js` sostiene 100 navegadores y 40 bots por segundo durante 45 segundos. k6 cuenta un `4xx` como fallo; el bot declara `403` como status esperado, así ese `403` no rompe el umbral. El p95 del navegador tiene que quedar bajo 500 ms. Ese número incluye al upstream. `upstream.js` repite solo los 100 por segundo contra el upstream directo. Se corren por separado. El overhead es el p99 del proxy menos el p99 del upstream. `--summary-trend-stats` muestra p99 y el máximo.
+
+```bash
+cd deploy/compose
+docker compose -f docker-compose.yml -f docker-compose.load.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.load.yml --profile load run --rm k6 \
+  run --summary-trend-stats="avg,med,p(95),p(99),max" /scripts/load.js
+docker compose -f docker-compose.yml -f docker-compose.load.yml --profile load run --rm k6 \
+  run --summary-trend-stats="avg,med,p(95),p(99),max" /scripts/upstream.js
+```
+
+Con k6 instalado en el portátil, los mismos scripts usan los puertos publicados:
+
+```bash
+BASE_URL=http://127.0.0.1:8080 HOST=shop.local k6 run scripts/k6/load.js
+UPSTREAM_URL=http://127.0.0.1:9000 HOST=shop.local k6 run scripts/k6/upstream.js
 ```
 
 `deploy/compose/prometheus/alerts.yml` define cinco alertas del job `guardian`:

@@ -1,0 +1,33 @@
+# Override de carga: config guardian.load.yml, upstream publicado para el
+# baseline, y un servicio k6 detrás del profile "load".
+#
+#   cd deploy/compose
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml --profile load run --rm k6
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml --profile load run --rm k6 run /scripts/upstream.js
+#
+# El directorio ./config ya viene montado desde docker-compose.yml.
+# k6, en la red de compose, habla con guardian:8080 y upstream:9000.
+# Desde tu Mac, con brew, usa los puertos publicados (8080 y 9000) y el
+# mismo Host: shop.local.
+services:
+  upstream:
+    ports:
+      - "127.0.0.1:9000:9000"  # baseline p99; solo tu laptop
+
+  guardian:
+    command: ["-config", "/etc/guardian/guardian.load.yml"]
+
+  k6:
+    profiles: ["load"]
+    image: grafana/k6:2.4.0
+    command: ["run", "/scripts/load.js"]
+    volumes:
+      - ../../scripts/k6:/scripts:ro
+    environment:
+      BASE_URL: http://guardian:8080
+      UPSTREAM_URL: http://upstream:9000
+      HOST: shop.local
+    depends_on:
+      guardian: { condition: service_started }
+      upstream: { condition: service_started }
