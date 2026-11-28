@@ -415,8 +415,10 @@ func newAdminServer(cfg *config.Config, store *acl.Store, reloader *configsource
 		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    16 << 10,
+		// 2 minutos: GET /debug/pprof/profile?seconds=30 (el default) más
+		// margen. Con 10s el servidor corta el perfil a la mitad.
+		WriteTimeout:   2 * time.Minute,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 16 << 10,
 	}, nil
 }

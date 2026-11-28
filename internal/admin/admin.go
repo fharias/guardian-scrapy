@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"slices"
 	"strconv"
 	"strings"
@@ -143,6 +144,17 @@ func NewHandler(o Options) (http.Handler, error) {
 	mux.HandleFunc("GET /v1/apps", s.handleApps)
 	mux.HandleFunc("POST /v1/reload", s.handleReload)
 	mux.HandleFunc("GET /v1/config", s.handleConfig)
+
+	// pprof queda en este mux, detrás de authenticate: el listener público
+	// no lo sirve. Registramos los handlers por nombre; no usamos
+	// http.DefaultServeMux (el init del paquete se registra ahí al
+	// importar, pero este proceso no lo sirve en ningún listener).
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 
 	return s.instrument(s.authenticate(mux)), nil
 }

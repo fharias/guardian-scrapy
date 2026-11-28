@@ -445,6 +445,37 @@ func TestActorIsSanitized(t *testing.T) {
 	}
 }
 
+func TestPprofRequiresToken(t *testing.T) {
+	a := newAPI(t, nil)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap"} {
+		rec := a.do(t, "GET", path, "", "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s sin token: code = %d, want 401", path, rec.Code)
+		}
+		rec = a.do(t, "GET", path, "token-equivocado-0123456789abcdef0123456789", "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s con token inválido: code = %d, want 401", path, rec.Code)
+		}
+	}
+
+	idx := a.do(t, "GET", "/debug/pprof/", tokenA, "")
+	if idx.Code != http.StatusOK {
+		t.Fatalf("/debug/pprof/ con token: code = %d, want 200", idx.Code)
+	}
+	if !strings.Contains(idx.Body.String(), "heap") {
+		t.Fatalf("/debug/pprof/ debería listar el perfil heap, body=%q", idx.Body.String())
+	}
+
+	heap := a.do(t, "GET", "/debug/pprof/heap", tokenA, "")
+	if heap.Code != http.StatusOK {
+		t.Fatalf("/debug/pprof/heap con token: code = %d, want 200", heap.Code)
+	}
+	if heap.Body.Len() == 0 {
+		t.Fatal("/debug/pprof/heap devolvió un cuerpo vacío")
+	}
+}
+
 // metricValue suma todas las series de una métrica del registry del test.
 func metricValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
 	t.Helper()
