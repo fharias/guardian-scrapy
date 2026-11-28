@@ -1,5 +1,7 @@
 # Performance de Guardian
 
+[English](perf.en.md)
+
 Cómo medimos el overhead del proxy, qué encontramos y qué arreglamos.
 Los números de **Fabio** son de su MacBook (M3 Pro) con Docker Desktop. Los
 números marcados **(caja)** son de una VM Linux x86 compartida: sirven para

@@ -91,6 +91,8 @@ flowchart TD
   ua --> fp[Fingerprint] --> ja4src[JA4] --> acl[ACL] --> ja4[JA4Mismatch] --> rep[Reputation] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
+`newUpstreamProxy` comparte `http.DefaultTransport` y un `httputil.BufferPool` de buffers de 32 KB (`cmd/guardian/bufpool.go`). Hay un solo pool en el proceso: cada recarga crea un `ReverseProxy` nuevo y el pool sigue, igual que el transport. Sin el pool, `ReverseProxy` hace `make([]byte, 32*1024)` en cada respuesta. `Get` devuelve un buffer de esa longitud. `Put` descarta uno cuya capacidad no es 32 KB. Guardar el slice en `sync.Pool` reserva el encabezado de 24 bytes en cada `Put` (staticcheck SA6002). La interfaz `BufferPool` entrega el slice y no el puntero, así que el código lo deja así. La medición está en [docs/perf.md](docs/perf.md).
+
 | Pieza | Paquete | Qué hace |
 | --- | --- | --- |
 | Proxy y servidores | `cmd/guardian` | YAML con recarga en caliente, HTTP, HTTPS, PROXY protocol, métricas, trazas, Valkey y apagado |
@@ -398,7 +400,9 @@ export GUARDIAN_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
 La API escucha en su propio proceso HTTP. `ReadHeaderTimeout` es 5 segundos, la lectura 10 segundos, la escritura 2 minutos, idle 60 segundos y el tope de cabeceras es 16 KiB. Esos 2 minutos cubren `GET /debug/pprof/profile`: el perfil de CPU por defecto dura 30 segundos y un `WriteTimeout` de 10 segundos lo cortaba a la mitad. `admin.listen` vacío queda en `127.0.0.1:9091`. El puerto no puede coincidir con `listen`, `tls.listen` ni `:2112`. En Compose el proceso escucha en `:9091` dentro del contenedor y el host lo ve solo en `127.0.0.1:9091`. El apagado de esa API entra en el mismo `Shutdown` que HTTP y HTTPS.
 
-`/debug/pprof/` vive en ese mismo mux, detrás del Bearer. `:8080` y `:2112` no lo sirven. Importar `net/http/pprof` también registra los perfiles en `http.DefaultServeMux`, y este proceso no escucha ese mux. Sin token la respuesta es `401`, igual que el resto de la API. Con token, el índice lista `heap`, `goroutine`, `allocs` y el resto. El perfil de CPU se pide con `seconds`. Un valor cerca de 2 minutos choca con el `WriteTimeout`.
+`/debug/pprof/` vive en ese mismo mux, detrás del Bearer. `:8080` y `:2112` no lo sirven. Importar `net/http/pprof` también registra los perfiles en `http.DefaultServeMux`, y este proceso no escucha ese mux. Sin token la respuesta es `401`, igual que el resto de la API. Con token, el índice lista `heap`, `goroutine`, `allocs`, `mutex`, `block` y el resto. `profile`, `trace`, `cmdline` y `symbol` tienen handler propio. El perfil de CPU se pide con `seconds`. Un valor cerca de 2 minutos choca con el `WriteTimeout`.
+
+`mutex` y `block` salen de ese índice, y el runtime los trae apagados. `admin.mutex_profile_fraction` y `admin.block_profile_rate` los encienden solo si `admin.enabled` es verdadero y el valor es mayor que 0. `ApplyProfiling` corre una vez al arrancar. Un 0 no toca el runtime. Un valor negativo, con la API encendida, falla la carga. El log `admin` escribe `mutex_profile_fraction` y `block_profile_rate`. `guardian.load.yml` usa fracción 5 y tasa `1ms`. En el resto de la config quedan en 0. `scripts/pprof-capture.sh` baja esos perfiles mientras corre la carga. `allocs`, `mutex` y `block` acumulan desde el arranque; la comparación resta el snapshot anterior con `go tool pprof -base`.
 
 ```bash
 curl -sH "Authorization: Bearer $GUARDIAN_ADMIN_TOKEN" \
@@ -418,7 +422,7 @@ Sin `Authorization: Bearer` válido la respuesta es `401`, con `WWW-Authenticate
 | `DELETE` | la misma ruta de una entrada | `204` si la borró, `404` si no estaba |
 | `POST` | `/v1/reload` | La misma recarga que fsnotify y `SIGHUP`, con motivo `admin_api` |
 | `GET` | `/v1/config` | `version`, `loaded_at` y la lista `reloadable`. No devuelve valores del YAML |
-| `GET` | `/debug/pprof/` | Índice de perfiles. También `heap`, `profile`, `trace`, `cmdline` y `symbol` |
+| `GET` | `/debug/pprof/` | Índice. Sirve `heap`, `goroutine`, `allocs`, `mutex` y `block`. `profile`, `trace`, `cmdline` y `symbol` tienen handler propio |
 
 `GET`, `PUT` y `DELETE` de una entrada existen en `/v1/{lista}/{kind}/{value}` y en `/v1/apps/{app}/{lista}/{kind}/{value}`.
 
@@ -483,6 +487,9 @@ guardian-config.yml           ejemplo para go run, con TLS en :8443
 deploy/compose/               stack local: guardian, upstream, Valkey, Jaeger, Prometheus y Grafana
 scripts/ci-local.sh           formato, vet, race, fuzz y, si se pide, integración
 scripts/k6/                   carga con k6: proxy y upstream directo
+scripts/pprof-capture.sh      perfiles de la Admin API durante la carga
+docs/perf.md                  overhead medido y el pool de buffers
+docs/perf.en.md               la misma nota, en inglés
 README.en.md                  esta documentación, en inglés
 Dockerfile                    imagen distroless de guardian o del upstream
 ```
@@ -560,6 +567,13 @@ go test -bench=. -benchmem ./internal/clientip ./internal/fingerprint ./internal
 | `BenchmarkCompute` | Huella de cabeceras de un Chrome |
 | `BenchmarkEvaluate` | `allow`, bot con varias señales, `DenyReason` y allowlist |
 | `BenchmarkLookup` | Host exacto, comodín y el mismo host con mayúsculas |
+| `BenchmarkUpstreamProxy` | Una vuelta del `ReverseProxy` real, con cuerpos de 256 B, 16 KiB y 64 KiB. Los `allocs/op` incluyen al `httptest.Server` |
+
+`BenchmarkUpstreamProxy` no entra en el comando de arriba. Se corre aparte:
+
+```bash
+go test ./cmd/guardian -run '^$' -bench BenchmarkUpstreamProxy -benchmem -count=10
+```
 
 ## Configuración
 
@@ -716,6 +730,8 @@ ja4:
 | `admin.cache_ttl` | no | `2s` | Caché local de la ACL. `0` vuelve a 2 s. Al pasar de 10 000 entradas se vacía |
 | `admin.stale_ttl` | no | `1m` | Si Valkey falla, cuánto sirve una lectura vieja. Tiene que ser mayor o igual que `cache_ttl` |
 | `admin.lookup_timeout` | no | `20ms` | Tope del `GET` de la ACL en el request |
+| `admin.mutex_profile_fraction` | no | `0` | 1 de cada N contenciones de mutex en `/debug/pprof/mutex`. `0` lo deja apagado. Pide `admin.enabled` y reinicio |
+| `admin.block_profile_rate` | no | `0` | Muestrea bloqueos de al menos esta duración en `/debug/pprof/block`. `0` lo deja apagado. Pide `admin.enabled` y reinicio |
 
 Campos desconocidos en el YAML hacen fallar el arranque. `upstream` tiene que ser una URL con esquema y host. Cada entrada de `trusted_proxies`, `rules.deny_cidrs` y `allow_cidrs` tiene que ser un CIDR válido. Cada `prefix` de `rules.routes` y de `modes.routes` tiene que empezar por `/`. Cada `modes.routes.mode` tiene que ser `monitor` o `enforce`.
 
@@ -739,7 +755,7 @@ La carga también rechaza la configuración cuando:
 - `events.buffer`, `events.batch_size`, `events.flush_interval`, `events.max_retries` o `events.retry_backoff` es negativo, o `events.batch_size` pasa de 500.
 - `reputation.enabled` es verdadero y `scoring.weights.ja4_reputation` es 0, la ventana no es múltiplo del bucket, el cociente pasa de 24, `min_distinct_ips` es menor que 2, o `ttl` y `lookup_timeout` no son mayores que 0.
 - `events.enabled` es verdadero y `GUARDIAN_EVENT_SALT` mide menos de 16 caracteres.
-- `admin.enabled` es verdadero y `admin.max_ttl` o `admin.lookup_timeout` no son mayores que 0, `admin.cache_ttl` es negativo, `admin.stale_ttl` es menor que `admin.cache_ttl`, o `admin.listen` usa el puerto de `listen`, de `tls.listen` o el `:2112`.
+- `admin.enabled` es verdadero y `admin.max_ttl` o `admin.lookup_timeout` no son mayores que 0, `admin.cache_ttl` es negativo, `admin.stale_ttl` es menor que `admin.cache_ttl`, `admin.mutex_profile_fraction` o `admin.block_profile_rate` es negativo, o `admin.listen` usa el puerto de `listen`, de `tls.listen` o el `:2112`.
 - `admin.enabled` es verdadero y `GUARDIAN_ADMIN_TOKEN` está vacío, trae más de dos tokens, o alguno mide menos de 32 caracteres.
 
 `GUARDIAN_UPSTREAM` sustituye el valor de `upstream` del archivo. `GUARDIAN_PASS_KEYS` es obligatoria y trae el llavero con el que se firman el desafío y el pase. `GUARDIAN_EVENT_SALT` es obligatoria solo cuando `events.enabled` es verdadero. `GUARDIAN_ADMIN_TOKEN` es obligatoria solo cuando `admin.enabled` es verdadero.
@@ -748,7 +764,7 @@ La carga también rechaza la configuración cuando:
 
 `guardian` vigila el archivo de `-config` y, sin reiniciar, vuelve a armar la cadena protegida cuando cambian `scoring`, `rules`, `modes`, `ja4.tools`, `apps` o `default_app`. Cada request lee el snapshot una vez al entrar y lo usa hasta el final. `POST /__guardian/verify` y el aggregator quedan con la config de arranque.
 
-En cada recarga se reconstruyen el scorer, las reglas, los modos y la política de JA4. El resto se creó al arrancar y se reutiliza: listeners, TLS, upstream, Valkey, el límite de tasa, el desafío, los bots, el origen del JA4, la reputación, la ACL, los eventos y las trazas.
+En cada recarga se reconstruyen el scorer, las reglas, los modos y la política de JA4. El resto se creó al arrancar y se reutiliza: listeners, TLS, upstream, Valkey, el límite de tasa, el desafío, los bots, el origen del JA4, la reputación, la ACL, los eventos y las trazas. El pool de buffers del `ReverseProxy` es del proceso y tampoco se recrea. `admin.mutex_profile_fraction` y `admin.block_profile_rate` se aplican una sola vez, en el arranque.
 
 - Se vigila el directorio del archivo con fsnotify. Ahí se ven el guardado atómico de un editor (temporal y rename) y el symlink `..data` de un ConfigMap de Kubernetes. Un `chmod` no dispara recarga.
 - `-config-poll` (10 s por defecto, `0` lo apaga) relee el archivo aunque fsnotify no avise. Si el hash no cambió, el log de debug dice `config_sin_cambios`.
@@ -1003,7 +1019,9 @@ awsl kinesis list-streams
 
 Hay dos apps y no hay `default_app`. k6 manda `Host: shop.local`. Un `Host` `127.0.0.1` recibe `421`. `shop` hereda `enforce`. `api.local` está en `monitor` y estos scripts no lo llaman. La carga es HTTP, así que `ja4.source: tls` no calcula JA4. El navegador trae `User-Agent` de Chrome y las cabeceras `Accept`, y el umbral lo deja en `200`. `curl/8.5.0` suma `ua_herramienta` (90) y, con umbral de bloqueo 85, recibe `403`.
 
-k6 es la imagen `grafana/k6:2.4.0` y solo arranca con el perfil `load`. Dentro de la red usa `http://guardian:8080` y `http://upstream:9000`. `load.js` sostiene 100 navegadores y 40 bots por segundo durante 45 segundos. k6 cuenta un `4xx` como fallo; el bot declara `403` como status esperado, así ese `403` no rompe el umbral. El p95 del navegador tiene que quedar bajo 500 ms. Ese número incluye al upstream. `upstream.js` repite solo los 100 por segundo contra el upstream directo. Se corren por separado. El overhead es el p99 del proxy menos el p99 del upstream. `--summary-trend-stats` muestra p99 y el máximo.
+k6 es la imagen `grafana/k6:2.4.0` y solo arranca con el perfil `load`. Dentro de la red usa `http://guardian:8080` y `http://upstream:9000`. `load.js` sostiene 100 navegadores y 40 bots por segundo. La duración sale de `DURATION` y, si no está, es 45 segundos. El compose la pasa al contenedor: `DURATION=90s docker compose ... run --rm k6`. Cada request lleva la etiqueta `kind:browser` o `kind:bot`. k6 cuenta un `4xx` como fallo; el bot declara `403` como status esperado, así ese `403` no rompe el umbral. El p95 del navegador tiene que quedar bajo 500 ms. Ese número incluye al upstream. `upstream.js` repite solo los 100 por segundo contra el upstream directo. Se corren por separado. El overhead es el p99 de `http_req_duration{kind:browser}` menos el p99 del upstream. `--summary-trend-stats` muestra p99 y el máximo. Los números medidos y el antes y después del pool están en [docs/perf.md](docs/perf.md).
+
+`guardian.load.yml` deja `admin.mutex_profile_fraction` en 5 y `admin.block_profile_rate` en `1ms`. El resto de los YAML los deja en 0. El override de carga también acepta `GODEBUG` en el servicio guardian. Vacío no cambia el runtime.
 
 ```bash
 cd deploy/compose
@@ -1020,6 +1038,15 @@ Con k6 instalado en el portátil, los mismos scripts usan los puertos publicados
 BASE_URL=http://127.0.0.1:8080 HOST=shop.local k6 run scripts/k6/load.js
 UPSTREAM_URL=http://127.0.0.1:9000 HOST=shop.local k6 run scripts/k6/upstream.js
 ```
+
+Con la carga en marcha, desde la raíz del repositorio:
+
+```bash
+export GUARDIAN_ADMIN_TOKEN="$(grep GUARDIAN_ADMIN_TOKEN deploy/compose/.env | cut -d= -f2)"
+./scripts/pprof-capture.sh
+```
+
+`scripts/pprof-capture.sh` pide a `:9091` un snapshot de `allocs`, `mutex` y `block`, luego el perfil de CPU (30 segundos, `CPU_SECONDS`) y el trace (5 segundos, `TRACE_SECONDS`), y después otra vez `allocs`, `heap`, `goroutine`, `mutex` y `block`. Los deja en `prof-<fecha>/`. Ese directorio no se versiona. `ADMIN_URL` por defecto es `http://127.0.0.1:9091`.
 
 `deploy/compose/prometheus/alerts.yml` define cinco alertas del job `guardian`:
 

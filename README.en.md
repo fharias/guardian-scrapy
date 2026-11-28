@@ -91,6 +91,8 @@ flowchart TD
   ua --> fp[Fingerprint] --> ja4src[JA4] --> acl[ACL] --> ja4[JA4Mismatch] --> rep[Reputation] --> rules[Rules] --> limite[RateLimit] --> score[Score] --> enforce[Enforce] --> origen[Upstream]
 ```
 
+`newUpstreamProxy` shares `http.DefaultTransport` and an `httputil.BufferPool` of 32 KB buffers (`cmd/guardian/bufpool.go`). There is one pool in the process: each reload creates a new `ReverseProxy` and the pool stays, the same as the transport. Without the pool, `ReverseProxy` does `make([]byte, 32*1024)` on every response. `Get` returns a buffer of that length. `Put` drops one whose capacity is not 32 KB. Storing the slice in `sync.Pool` allocates the 24-byte header on every `Put` (staticcheck SA6002). The `BufferPool` interface hands over the slice and not the pointer, so the code keeps it that way. The measurement is in [docs/perf.en.md](docs/perf.en.md).
+
 | Piece | Package | What it does |
 | --- | --- | --- |
 | Proxy and servers | `cmd/guardian` | YAML with hot reload, HTTP, HTTPS, PROXY protocol, metrics, traces, Valkey, and shutdown |
@@ -398,7 +400,9 @@ export GUARDIAN_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
 The API listens on its own HTTP process. `ReadHeaderTimeout` is 5 seconds, the read is 10 seconds, the write is 2 minutes, idle is 60 seconds, and the header cap is 16 KiB. Those 2 minutes cover `GET /debug/pprof/profile`: the default CPU profile lasts 30 seconds, and a `WriteTimeout` of 10 seconds used to cut it in half. An empty `admin.listen` becomes `127.0.0.1:9091`. The port cannot match `listen`, `tls.listen`, or `:2112`. In Compose the process listens on `:9091` inside the container and the host sees it only at `127.0.0.1:9091`. Shutdown of that API is part of the same `Shutdown` as HTTP and HTTPS.
 
-`/debug/pprof/` lives on that same mux, behind the Bearer. `:8080` and `:2112` do not serve it. Importing `net/http/pprof` also registers the profiles on `http.DefaultServeMux`, and this process does not listen on that mux. Without a token the response is `401`, the same as the rest of the API. With a token, the index lists `heap`, `goroutine`, `allocs`, and the rest. The CPU profile is requested with `seconds`. A value near 2 minutes hits `WriteTimeout`.
+`/debug/pprof/` lives on that same mux, behind the Bearer. `:8080` and `:2112` do not serve it. Importing `net/http/pprof` also registers the profiles on `http.DefaultServeMux`, and this process does not listen on that mux. Without a token the response is `401`, the same as the rest of the API. With a token, the index lists `heap`, `goroutine`, `allocs`, `mutex`, `block`, and the rest. `profile`, `trace`, `cmdline`, and `symbol` have their own handler. The CPU profile is requested with `seconds`. A value near 2 minutes hits `WriteTimeout`.
+
+`mutex` and `block` come from that index, and the runtime ships them off. `admin.mutex_profile_fraction` and `admin.block_profile_rate` turn them on only when `admin.enabled` is true and the value is greater than 0. `ApplyProfiling` runs once at startup. A 0 does not touch the runtime. A negative value, with the API on, fails the load. The `admin` log writes `mutex_profile_fraction` and `block_profile_rate`. `guardian.load.yml` uses fraction 5 and rate `1ms`. The rest of the config leaves them at 0. `scripts/pprof-capture.sh` downloads those profiles while the load is running. `allocs`, `mutex`, and `block` accumulate from startup; the comparison subtracts the earlier snapshot with `go tool pprof -base`.
 
 ```bash
 curl -sH "Authorization: Bearer $GUARDIAN_ADMIN_TOKEN" \
@@ -418,7 +422,7 @@ Without a valid `Authorization: Bearer` the response is `401`, with `WWW-Authent
 | `DELETE` | the same path of one entry | `204` if it deleted it, `404` if it was not there |
 | `POST` | `/v1/reload` | The same reload as fsnotify and `SIGHUP`, with reason `admin_api` |
 | `GET` | `/v1/config` | `version`, `loaded_at`, and the `reloadable` list. It does not return YAML values |
-| `GET` | `/debug/pprof/` | Profile index. Also `heap`, `profile`, `trace`, `cmdline`, and `symbol` |
+| `GET` | `/debug/pprof/` | Index. It serves `heap`, `goroutine`, `allocs`, `mutex`, and `block`. `profile`, `trace`, `cmdline`, and `symbol` have their own handler |
 
 `GET`, `PUT`, and `DELETE` of one entry exist at `/v1/{lista}/{kind}/{value}` and at `/v1/apps/{app}/{lista}/{kind}/{value}`.
 
@@ -483,6 +487,9 @@ guardian-config.yml           example for go run, with TLS on :8443
 deploy/compose/               local stack: guardian, upstream, Valkey, Jaeger, Prometheus, and Grafana
 scripts/ci-local.sh           format, vet, race, fuzz, and integration when asked
 scripts/k6/                   k6 load: proxy and the upstream directly
+scripts/pprof-capture.sh      Admin API profiles captured during the load
+docs/perf.md                  measured overhead and the buffer pool, in Spanish
+docs/perf.en.md               the same note, in English
 README.md                     this documentation, in Spanish
 Dockerfile                    distroless image of guardian or the upstream
 ```
@@ -560,6 +567,13 @@ go test -bench=. -benchmem ./internal/clientip ./internal/fingerprint ./internal
 | `BenchmarkCompute` | The header fingerprint of a Chrome |
 | `BenchmarkEvaluate` | `allow`, a bot with several signals, `DenyReason`, and the allowlist |
 | `BenchmarkLookup` | An exact host, a wildcard, and the same host with capitals |
+| `BenchmarkUpstreamProxy` | One pass through the real `ReverseProxy`, with bodies of 256 B, 16 KiB, and 64 KiB. The `allocs/op` include the `httptest.Server` |
+
+`BenchmarkUpstreamProxy` is not part of the command above. It runs on its own:
+
+```bash
+go test ./cmd/guardian -run '^$' -bench BenchmarkUpstreamProxy -benchmem -count=10
+```
 
 ## Configuration
 
@@ -716,6 +730,8 @@ ja4:
 | `admin.cache_ttl` | no | `2s` | Local ACL cache. `0` goes back to 2 s. Past 10,000 entries it is wiped |
 | `admin.stale_ttl` | no | `1m` | If Valkey fails, how long an old read is served. It has to be greater than or equal to `cache_ttl` |
 | `admin.lookup_timeout` | no | `20ms` | Cap of the ACL `GET` on the request |
+| `admin.mutex_profile_fraction` | no | `0` | 1 of every N mutex contentions in `/debug/pprof/mutex`. `0` leaves it off. It needs `admin.enabled` and a restart |
+| `admin.block_profile_rate` | no | `0` | Samples blocks of at least this duration in `/debug/pprof/block`. `0` leaves it off. It needs `admin.enabled` and a restart |
 
 Unknown fields in the YAML fail startup. `upstream` has to be a URL with a scheme and a host. Each entry of `trusted_proxies`, `rules.deny_cidrs`, and `allow_cidrs` has to be a valid CIDR. Each `prefix` of `rules.routes` and of `modes.routes` has to start with `/`. Each `modes.routes.mode` has to be `monitor` or `enforce`.
 
@@ -739,7 +755,7 @@ Loading also rejects the configuration when:
 - `events.buffer`, `events.batch_size`, `events.flush_interval`, `events.max_retries`, or `events.retry_backoff` is negative, or `events.batch_size` exceeds 500.
 - `reputation.enabled` is true and `scoring.weights.ja4_reputation` is 0, the window is not a multiple of the bucket, the quotient exceeds 24, `min_distinct_ips` is less than 2, or `ttl` and `lookup_timeout` are not greater than 0.
 - `events.enabled` is true and `GUARDIAN_EVENT_SALT` is shorter than 16 characters.
-- `admin.enabled` is true and `admin.max_ttl` or `admin.lookup_timeout` are not greater than 0, `admin.cache_ttl` is negative, `admin.stale_ttl` is less than `admin.cache_ttl`, or `admin.listen` uses the port of `listen`, of `tls.listen`, or `:2112`.
+- `admin.enabled` is true and `admin.max_ttl` or `admin.lookup_timeout` are not greater than 0, `admin.cache_ttl` is negative, `admin.stale_ttl` is less than `admin.cache_ttl`, `admin.mutex_profile_fraction` or `admin.block_profile_rate` is negative, or `admin.listen` uses the port of `listen`, of `tls.listen`, or `:2112`.
 - `admin.enabled` is true and `GUARDIAN_ADMIN_TOKEN` is empty, brings more than two tokens, or one of them is shorter than 32 characters.
 
 `GUARDIAN_UPSTREAM` replaces the file's `upstream` value. `GUARDIAN_PASS_KEYS` is required and brings the keyring that signs the challenge and the pass. `GUARDIAN_EVENT_SALT` is required only when `events.enabled` is true. `GUARDIAN_ADMIN_TOKEN` is required only when `admin.enabled` is true.
@@ -748,7 +764,7 @@ Loading also rejects the configuration when:
 
 `guardian` watches the `-config` file and, without restarting, rebuilds the protected chain when `scoring`, `rules`, `modes`, `ja4.tools`, `apps`, or `default_app` change. Each request reads the snapshot once on entry and uses it until the end. `POST /__guardian/verify` and the aggregator stay on the startup config.
 
-On each reload the scorer, the rules, the modes, and the JA4 policy are rebuilt. The rest was created at startup and is reused: listeners, TLS, upstream, Valkey, the rate limit, the challenge, the bots, the JA4 source, reputation, the ACL, events, and traces.
+On each reload the scorer, the rules, the modes, and the JA4 policy are rebuilt. The rest was created at startup and is reused: listeners, TLS, upstream, Valkey, the rate limit, the challenge, the bots, the JA4 source, reputation, the ACL, events, and traces. The `ReverseProxy` buffer pool belongs to the process and is not recreated either. `admin.mutex_profile_fraction` and `admin.block_profile_rate` are applied once, at startup.
 
 - The file's directory is watched with fsnotify. That is where an editor's atomic save (temp file and rename) and the `..data` symlink of a Kubernetes ConfigMap show up. A `chmod` does not trigger a reload.
 - `-config-poll` (10 s by default, `0` turns it off) re-reads the file even if fsnotify does not notify. If the hash did not change, the debug log says `config_sin_cambios`.
@@ -1003,7 +1019,9 @@ awsl kinesis list-streams
 
 There are two apps and there is no `default_app`. k6 sends `Host: shop.local`. A `Host` of `127.0.0.1` receives `421`. `shop` inherits `enforce`. `api.local` is in `monitor` and these scripts do not call it. The load is HTTP, so `ja4.source: tls` does not compute a JA4. The browser brings a Chrome `User-Agent` and the `Accept` headers, and the threshold leaves it at `200`. `curl/8.5.0` adds `ua_herramienta` (90) and, with a block threshold of 85, receives `403`.
 
-k6 is the image `grafana/k6:2.4.0` and it only starts with the `load` profile. Inside the network it uses `http://guardian:8080` and `http://upstream:9000`. `load.js` holds 100 browsers and 40 bots per second for 45 seconds. k6 counts a `4xx` as a failure; the bot declares `403` as an expected status, so that `403` does not break the threshold. The browser p95 has to stay under 500 ms. That number includes the upstream. `upstream.js` repeats only the 100 per second against the upstream directly. They are run separately. The overhead is the proxy p99 minus the upstream p99. `--summary-trend-stats` shows p99 and the maximum.
+k6 is the image `grafana/k6:2.4.0` and it only starts with the `load` profile. Inside the network it uses `http://guardian:8080` and `http://upstream:9000`. `load.js` holds 100 browsers and 40 bots per second. The duration comes from `DURATION` and, if it is absent, it is 45 seconds. Compose passes it to the container: `DURATION=90s docker compose ... run --rm k6`. Each request carries the tag `kind:browser` or `kind:bot`. k6 counts a `4xx` as a failure; the bot declares `403` as an expected status, so that `403` does not break the threshold. The browser p95 has to stay under 500 ms. That number includes the upstream. `upstream.js` repeats only the 100 per second against the upstream directly. They are run separately. The overhead is the p99 of `http_req_duration{kind:browser}` minus the upstream p99. `--summary-trend-stats` shows p99 and the maximum. The measured numbers and the before and after of the pool are in [docs/perf.en.md](docs/perf.en.md).
+
+`guardian.load.yml` leaves `admin.mutex_profile_fraction` at 5 and `admin.block_profile_rate` at `1ms`. The rest of the YAML files leave them at 0. The load override also accepts `GODEBUG` on the guardian service. Empty does not change the runtime.
 
 ```bash
 cd deploy/compose
@@ -1020,6 +1038,15 @@ With k6 installed on the laptop, the same scripts use the published ports:
 BASE_URL=http://127.0.0.1:8080 HOST=shop.local k6 run scripts/k6/load.js
 UPSTREAM_URL=http://127.0.0.1:9000 HOST=shop.local k6 run scripts/k6/upstream.js
 ```
+
+With the load running, from the repository root:
+
+```bash
+export GUARDIAN_ADMIN_TOKEN="$(grep GUARDIAN_ADMIN_TOKEN deploy/compose/.env | cut -d= -f2)"
+./scripts/pprof-capture.sh
+```
+
+`scripts/pprof-capture.sh` asks `:9091` for a snapshot of `allocs`, `mutex`, and `block`, then the CPU profile (30 seconds, `CPU_SECONDS`) and the trace (5 seconds, `TRACE_SECONDS`), and then `allocs`, `heap`, `goroutine`, `mutex`, and `block` again. It leaves them in `prof-<date>/`. That directory is not versioned. `ADMIN_URL` defaults to `http://127.0.0.1:9091`.
 
 `deploy/compose/prometheus/alerts.yml` defines five alerts for the `guardian` job:
 
